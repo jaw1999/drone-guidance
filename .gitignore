@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project
+logs/*.log
+!logs/.gitkeep
+config/local.yaml
+*.pt
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db

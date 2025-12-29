@@ -1,0 +1,243 @@
+"""PID controller for target tracking."""
+
+import time
+import logging
+from dataclasses import dataclass
+from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PIDGains:
+    """PID controller gains."""
+    kp: float = 0.5
+    ki: float = 0.01
+    kd: float = 0.1
+    max_output: float = 30.0
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "PIDGains":
+        """Create gains from dictionary."""
+        return cls(
+            kp=config.get("kp", 0.5),
+            ki=config.get("ki", 0.01),
+            kd=config.get("kd", 0.1),
+            max_output=config.get("max_rate", 30.0),
+        )
+
+
+@dataclass
+class PIDConfig:
+    """PID controller configuration."""
+    yaw: PIDGains
+    pitch: PIDGains
+    throttle: PIDGains
+    dead_zone_percent: float = 5.0
+    update_rate: float = 20.0
+
+    @classmethod
+    def from_dict(cls, config: dict) -> "PIDConfig":
+        """Create config from dictionary."""
+        pid = config.get("pid", {})
+        return cls(
+            yaw=PIDGains.from_dict(pid.get("yaw", {})),
+            pitch=PIDGains.from_dict(pid.get("pitch", {})),
+            throttle=PIDGains.from_dict(pid.get("throttle", {})),
+            dead_zone_percent=pid.get("dead_zone_percent", 5.0),
+            update_rate=pid.get("update_rate", 20.0),
+        )
+
+
+class PIDAxis:
+    """Single-axis PID controller with anti-windup."""
+
+    def __init__(self, gains: PIDGains):
+        self.gains = gains
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_time: Optional[float] = None
+
+        # Anti-windup limit
+        self._integral_limit = gains.max_output / (gains.ki if gains.ki > 0 else 1.0)
+
+    def update(self, error: float, dt: Optional[float] = None) -> float:
+        """
+        Calculate PID output for given error.
+
+        Args:
+            error: Current error value (normalized -1 to 1)
+            dt: Time delta in seconds (calculated automatically if None)
+
+        Returns:
+            Control output (clamped to max_output)
+        """
+        current_time = time.time()
+
+        if dt is None:
+            if self._prev_time is None:
+                dt = 0.05  # Default 20Hz
+            else:
+                dt = current_time - self._prev_time
+        self._prev_time = current_time
+
+        # Prevent division by zero
+        dt = max(dt, 0.001)
+
+        # Proportional term
+        p_term = self.gains.kp * error
+
+        # Integral term with anti-windup
+        self._integral += error * dt
+        self._integral = max(-self._integral_limit,
+                            min(self._integral_limit, self._integral))
+        i_term = self.gains.ki * self._integral
+
+        # Derivative term
+        derivative = (error - self._prev_error) / dt
+        d_term = self.gains.kd * derivative
+        self._prev_error = error
+
+        # Sum and clamp output
+        output = p_term + i_term + d_term
+        output = max(-self.gains.max_output, min(self.gains.max_output, output))
+
+        return output
+
+    def reset(self) -> None:
+        """Reset controller state."""
+        self._integral = 0.0
+        self._prev_error = 0.0
+        self._prev_time = None
+
+
+@dataclass
+class ControlOutput:
+    """Control output for flight controller."""
+    yaw_rate: float = 0.0      # deg/sec, positive = turn right
+    pitch_rate: float = 0.0    # deg/sec, positive = pitch up (climb)
+    throttle_rate: float = 0.0  # m/sec, positive = increase throttle
+    is_active: bool = False     # Whether control is active
+
+
+class PIDController:
+    """
+    Multi-axis PID controller for target tracking.
+
+    Converts tracking error to flight control commands.
+    """
+
+    def __init__(self, config: PIDConfig):
+        self.config = config
+        self._yaw = PIDAxis(config.yaw)
+        self._pitch = PIDAxis(config.pitch)
+        self._throttle = PIDAxis(config.throttle)
+        self._enabled = False
+        self._dead_zone = config.dead_zone_percent / 100.0
+
+    @property
+    def enabled(self) -> bool:
+        """Check if controller is enabled."""
+        return self._enabled
+
+    @property
+    def dead_zone(self) -> float:
+        """Get dead zone as fraction."""
+        return self._dead_zone
+
+    @dead_zone.setter
+    def dead_zone(self, value: float) -> None:
+        """Set dead zone as fraction."""
+        self._dead_zone = value
+
+    def update_gains(self, axis: str, kp: float = None, ki: float = None,
+                     kd: float = None, max_rate: float = None) -> None:
+        """Update gains for a specific axis."""
+        pid_axis = {"yaw": self._yaw, "pitch": self._pitch, "throttle": self._throttle}.get(axis)
+        if not pid_axis:
+            return
+        if kp is not None:
+            pid_axis.gains.kp = kp
+        if ki is not None:
+            pid_axis.gains.ki = ki
+        if kd is not None:
+            pid_axis.gains.kd = kd
+        if max_rate is not None:
+            pid_axis.gains.max_output = max_rate
+        logger.info(f"Updated {axis} PID gains: kp={pid_axis.gains.kp}, ki={pid_axis.gains.ki}, kd={pid_axis.gains.kd}")
+
+    def enable(self) -> None:
+        """Enable control output."""
+        self._enabled = True
+        logger.info("PID controller enabled")
+
+    def disable(self) -> None:
+        """Disable control output and reset."""
+        self._enabled = False
+        self.reset()
+        logger.info("PID controller disabled")
+
+    def reset(self) -> None:
+        """Reset all controller states."""
+        self._yaw.reset()
+        self._pitch.reset()
+        self._throttle.reset()
+
+    def update(
+        self,
+        error: Optional[Tuple[float, float]],
+        target_size: Optional[float] = None
+    ) -> ControlOutput:
+        """
+        Calculate control output from tracking error.
+
+        Args:
+            error: (x_error, y_error) normalized to [-1, 1]
+                   None if no target
+            target_size: Optional relative target size for throttle control
+                        (larger = closer = slow down)
+
+        Returns:
+            ControlOutput with rate commands
+        """
+        if not self._enabled or error is None:
+            return ControlOutput(is_active=False)
+
+        x_error, y_error = error
+
+        # Apply dead zone
+        if abs(x_error) < self._dead_zone:
+            x_error = 0.0
+        if abs(y_error) < self._dead_zone:
+            y_error = 0.0
+
+        # Calculate control outputs
+        # Positive X error (target right of center) -> positive yaw (turn right)
+        yaw_rate = self._yaw.update(x_error)
+
+        # Positive Y error (target below center) -> negative pitch (nose down)
+        # Invert because in image coords, Y increases downward
+        pitch_rate = -self._pitch.update(y_error)
+
+        # Throttle based on target size (optional)
+        throttle_rate = 0.0
+        if target_size is not None:
+            # Target size error: desired ~0.2 of frame, adjust throttle to maintain
+            size_error = 0.2 - target_size
+            throttle_rate = self._throttle.update(size_error)
+
+        return ControlOutput(
+            yaw_rate=yaw_rate,
+            pitch_rate=pitch_rate,
+            throttle_rate=throttle_rate,
+            is_active=True,
+        )
+
+    def get_status(self) -> dict:
+        """Get controller status for telemetry."""
+        return {
+            "enabled": self._enabled,
+            "yaw_integral": self._yaw._integral,
+            "pitch_integral": self._pitch._integral,
+            "throttle_integral": self._throttle._integral,
+        }

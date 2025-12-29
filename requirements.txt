@@ -1,0 +1,26 @@
+# Terminal Guidance Dependencies
+# For Raspberry Pi 5
+
+# Core
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+PyYAML>=6.0
+
+# Detection
+ultralytics>=8.0.0
+
+# MAVLink
+pymavlink>=2.4.40
+
+# Tracking
+scipy>=1.11.0
+
+# Web UI
+flask>=3.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Optional: Pi 5 hardware acceleration
+# picamera2  # uncomment for Pi camera support

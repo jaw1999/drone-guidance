@@ -1,0 +1,226 @@
+# Terminal Guidance - Drone Companion Computer Configuration
+# =========================================================
+
+# Camera Input Configuration
+camera:
+  # Camera source - can be:
+  # - RTSP URL: "rtsp://192.168.1.10:554/stream"
+  # - Webcam index: "0" (or "1", "2", etc.)
+  # - Video file: "/path/to/video.mp4"
+  # - HTTP MJPEG: "http://192.168.1.129:8554/stream"
+  rtsp_url: "rtsp://192.168.1.129:8554/stream"
+
+  # Camera specifications (used for FOV calculations)
+  # Lower resolution for webcam testing, increase for RTSP
+  resolution:
+    width: 1280
+    height: 720
+
+  # Horizontal and vertical field of view in degrees
+  fov:
+    horizontal: 90.0
+    vertical: 60.0
+
+  # Capture settings
+  fps: 30
+  buffer_size: 1  # Keep low for minimal latency
+
+  # Reconnection settings
+  reconnect_attempts: 5
+  reconnect_delay_sec: 2.0
+
+# Detection Model Configuration
+detector:
+  # Model selection: yolo11n (recommended), yolo11s, yolov8n, yolov8s
+  # YOLO11n is ~30% faster than YOLOv8n on Pi 5 CPU
+  model: "yolo11n"
+
+  # Path to custom model weights (optional, uses default if empty)
+  weights_path: ""
+
+  # Inference settings
+  confidence_threshold: 0.5
+  nms_threshold: 0.45
+
+  # Target classes to detect (COCO class names)
+  # Empty list = detect all classes
+  target_classes:
+    - "person"
+    - "car"
+    - "truck"
+    - "boat"
+
+  # Processing settings
+  input_size: 320  # Model input resolution (320 = fast, 416 = balanced, 640 = accurate)
+  half_precision: false  # FP16 - not supported on Pi CPU, keep false
+
+  # Performance: run detection every N frames (1 = every frame)
+  # Higher values reduce CPU load, tracking interpolates between
+  detection_interval: 3  # Every 3rd frame at 30fps = 10 detections/sec
+
+  # Detection resolution (downscale before sending to model)
+  detection_resolution:
+    width: 320
+    height: 320
+
+  # ROI detection: when locked, only scan area around target
+  roi_detection:
+    enabled: true
+    padding_percent: 50  # Extra area around target bbox
+
+# Target Tracking Configuration
+tracker:
+  # Tracking algorithm: centroid, sort, deepsort
+  algorithm: "centroid"
+
+  # Max frames to keep tracking without detection
+  max_disappeared: 30
+
+  # Distance threshold for object association (pixels)
+  # Higher value allows tracking faster-moving objects
+  max_distance: 150
+
+  # Lock-on settings
+  lock_on:
+    # Minimum confidence to initiate lock
+    min_confidence: 0.6
+    # Frames target must be visible before lock
+    frames_to_lock: 5
+    # Frames without target before losing lock
+    frames_to_unlock: 15
+
+# PID Controller Configuration
+pid:
+  # Yaw control (horizontal centering)
+  yaw:
+    kp: 0.5
+    ki: 0.01
+    kd: 0.1
+    max_rate: 30.0  # Max yaw rate in deg/sec
+
+  # Pitch control (vertical centering)
+  pitch:
+    kp: 0.4
+    ki: 0.01
+    kd: 0.08
+    max_rate: 20.0  # Max pitch rate in deg/sec
+
+  # Throttle control (distance/altitude)
+  throttle:
+    kp: 0.3
+    ki: 0.005
+    kd: 0.05
+    max_rate: 2.0  # Max climb rate in m/sec
+
+  # Dead zone - no correction if target within this % of center
+  dead_zone_percent: 5.0
+
+  # Control update rate (Hz)
+  update_rate: 20
+
+# MAVLink Configuration
+mavlink:
+  # Connection string to flight controller
+  connection: "udp:192.168.1.1:14550"
+
+  # System/Component IDs
+  source_system: 255
+  source_component: 190
+
+  # Heartbeat rate (Hz)
+  heartbeat_rate: 1.0
+
+  # Command timeout (seconds)
+  command_timeout: 5.0
+
+  # Enable actual control commands (set false for testing)
+  enable_control: false
+
+# Safety Configuration
+safety:
+  # Action when target is lost: hover, loiter, rtl, continue_last, land
+  target_lost_action: "loiter"
+
+  # Maximum time to search for lost target before safety action (seconds)
+  search_timeout: 10.0
+
+  # Geofence settings
+  geofence:
+    enabled: true
+    max_distance_m: 500  # Max distance from home
+    max_altitude_m: 120  # Max altitude AGL
+    min_altitude_m: 10   # Min altitude AGL
+
+  # Emergency stop - immediately halt all tracking
+  emergency_stop_enabled: true
+
+  # Minimum battery percentage before forced RTL
+  min_battery_percent: 20
+
+  # Maximum tracking speed (m/s)
+  max_tracking_speed: 10.0
+
+  # Require ARM confirmation before tracking
+  require_arm_confirmation: true
+
+# Output Stream Configuration
+output:
+  # UDP H.264 stream to QGroundControl
+  # QGC Settings: Video Source = UDP h.264, Port = 5600
+  stream:
+    enabled: true
+    udp_host: "192.168.1.129"  # Mac running QGC
+    udp_port: 5600
+
+  # Output resolution (independent of input)
+  resolution:
+    width: 1280
+    height: 720
+
+  fps: 30
+  bitrate_kbps: 2000
+
+  # Encoding: h264, h265
+  codec: "h264"
+
+  # Use Pi 5 hardware encoder (much faster, lower CPU)
+  # Requires v4l2-utils: sudo apt install v4l-utils
+  # Set to false for macOS/non-Pi testing
+  hardware_encode: false
+
+  # Overlay settings
+  overlay:
+    show_detections: true
+    show_locked_target: true
+    show_tracking_info: true
+    show_telemetry: true
+    font_scale: 0.6
+    box_thickness: 2
+
+# Web UI Configuration (config-only, video goes direct to QGC via UDP)
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 5000
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/terminal_guidance.log"
+  max_size_mb: 10
+  backup_count: 3
+
+  # Log performance metrics
+  log_performance: true
+  performance_interval_sec: 30
+
+# System Configuration
+system:
+  # Threading settings
+  max_workers: 4
+
+  # GPU acceleration (if available)
+  use_gpu: false
+
+  # Performance mode: balanced, performance, power_save
+  performance_mode: "balanced"

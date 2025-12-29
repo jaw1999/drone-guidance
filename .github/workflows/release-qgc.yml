@@ -1,0 +1,93 @@
+name: Release QGC
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create release for (e.g., v1.0.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-all:
+    name: Build All Platforms
+    uses: ./.github/workflows/build-qgc-linux.yml
+    secrets: inherit
+
+  build-macos:
+    name: Build macOS
+    uses: ./.github/workflows/build-qgc-macos.yml
+    secrets: inherit
+
+  build-windows:
+    name: Build Windows
+    uses: ./.github/workflows/build-qgc-windows.yml
+    secrets: inherit
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-all, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get tag info
+        id: tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ -z "$TAG" ] || [ "$TAG" = "$GITHUB_REF" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Tag: $TAG"
+
+          if [[ "$TAG" == *"-"* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find artifacts -type f | head -50 || echo "No artifacts found"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Drone Guidance QGC ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          files: |
+            artifacts/**/*.AppImage
+            artifacts/**/*.dmg
+            artifacts/**/*.exe
+          fail_on_unmatched_files: false
+          body: |
+            ## Drone Guidance - QGroundControl Release
+
+            This release contains pre-built QGroundControl binaries for:
+            - **Windows** (.exe installer)
+            - **macOS** (.dmg)
+            - **Linux** (.AppImage)
+
+            ### Installation
+            - **Windows**: Download and run the `.exe` installer
+            - **macOS**: Download the `.dmg`, open it, and drag the app to Applications
+            - **Linux**: Download the `.AppImage`, make it executable (`chmod +x`), and run it
