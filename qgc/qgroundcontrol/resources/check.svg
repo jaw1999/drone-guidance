@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:osb="http://www.openswatchbook.org/uri/2009/osb" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" viewBox="0 0 72 72">
+    <defs>
+        <linearGradient osb:paint="solid" id="a">
+            <stop offset="0" style="stop-color:#fff;stop-opacity:1"/>
+        </linearGradient>
+        <linearGradient xlink:href="#a" id="b" x1="48.508" x2="79.322" y1="58.424" y2="58.424" gradientTransform="matrix(1.8414 0 0 2.24075 -82.182 -94.29)" gradientUnits="userSpaceOnUse"/>
+    </defs>
+    <path d="M55.1 19.8 30.2 52.2 16.9 36.5" style="fill:none;stroke:#fff;stroke-width:5;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:10" transform="translate(5.127 8.204)scale(.85559)"/>
+    <circle cx="35.512" cy="36.624" r="28.37" style="fill:none;stroke:url(#b);stroke-width:3.25963402;stroke-miterlimit:4;stroke-dasharray:none"/>
+</svg>

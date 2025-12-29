@@ -27,3 +27,10 @@ config/local.yaml
 # OS
 .DS_Store
 Thumbs.db
+
+# QGC build artifacts
+qgc/qgroundcontrol/build/
+
+# Large files - exclude from repo
+videos/*.mp4
+*.ulg

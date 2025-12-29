@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="48" height="48" version="1.0">
+    <defs>
+        <linearGradient id="e">
+            <stop offset="0" style="stop-color:#000;stop-opacity:1"/>
+            <stop offset="1" style="stop-color:#fff;stop-opacity:.48453608"/>
+        </linearGradient>
+        <linearGradient id="b">
+            <stop offset="0" style="stop-color:#babdb6"/>
+            <stop offset="1" style="stop-color:#555753"/>
+        </linearGradient>
+        <linearGradient id="a">
+            <stop offset="0" style="stop-color:#f7f7f7;stop-opacity:1"/>
+            <stop offset="1" style="stop-color:#ccd0c7;stop-opacity:1"/>
+        </linearGradient>
+        <linearGradient id="c">
+            <stop offset="0" style="stop-color:#fff;stop-opacity:1"/>
+            <stop offset="1" style="stop-color:#fff;stop-opacity:0"/>
+        </linearGradient>
+        <linearGradient xlink:href="#c" id="i" x1="15.09" x2="14" y1="15.292" y2="52.511" gradientTransform="matrix(3.0002 0 0 1 -67.006 -.094)" gradientUnits="userSpaceOnUse"/>
+        <linearGradient xlink:href="#b" id="h" x1="169" x2="169" y1="110.338" y2="93.205" gradientTransform="matrix(2.49888 0 0 1.00438 -414.062 -71.463)" gradientUnits="userSpaceOnUse"/>
+        <linearGradient xlink:href="#e" id="f" x1="174.834" x2="174.745" y1="84.263" y2="105.491" gradientTransform="matrix(2.62453 0 0 1.05492 -436.102 -76.311)" gradientUnits="userSpaceOnUse"/>
+        <radialGradient xlink:href="#a" id="g" cx="169.772" cy="100.201" r="11" fx="169.772" fy="100.201" gradientTransform="matrix(0 -1.07205 4.98026 0 -490.78 212.695)" gradientUnits="userSpaceOnUse"/>
+    </defs>
+    <g style="display:inline">
+        <path d="M14.004 12.83v22.152H35V12.83z" style="opacity:.15;color:#000;fill:none;fill-opacity:1;fill-rule:evenodd;stroke:url(#f);stroke-width:1.99999952;stroke-linecap:square;stroke-linejoin:round;marker:none;marker-start:none;marker-mid:none;marker-end:none;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;visibility:visible;display:inline;overflow:visible"/>
+        <path d="M14.5 13.406v21h20v-21z" style="color:#000;fill:url(#g);fill-opacity:1;fill-rule:evenodd;stroke:none;stroke-width:1;stroke-linecap:square;stroke-linejoin:miter;marker:none;marker-start:none;marker-mid:none;marker-end:none;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;visibility:visible;display:inline;overflow:visible"/>
+        <path d="M14.497 13.408V34.5h19.99V13.408z" style="color:#000;fill:none;fill-opacity:1;fill-rule:evenodd;stroke:url(#h);stroke-width:.99999952;stroke-linecap:square;stroke-linejoin:round;marker:none;marker-start:none;marker-mid:none;marker-end:none;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;visibility:visible;display:inline;overflow:visible"/>
+        <path d="M15.5 14.406v19h18v-19z" style="color:#000;fill:none;fill-opacity:1;fill-rule:evenodd;stroke:url(#i);stroke-width:.99999976;stroke-linecap:square;stroke-linejoin:miter;marker:none;marker-start:none;marker-mid:none;marker-end:none;stroke-miterlimit:4;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;visibility:visible;display:inline;overflow:visible"/>
+        <path d="M16 14.943V25.5l17-2.79v-7.856z" style="opacity:.5;color:#000;fill:#f7f7f7;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;marker:none;marker-start:none;marker-mid:none;marker-end:none;stroke-miterlimit:10;stroke-dasharray:none;stroke-dashoffset:0;stroke-opacity:1;visibility:visible;display:block;overflow:visible"/>
+    </g>
+</svg>
