@@ -17,7 +17,6 @@ on:
       - 'qgc/**'
       - '.github/workflows/build-qgc-linux.yml'
   workflow_dispatch:
-  workflow_call:
     inputs:
       build_type:
         description: 'Build type'
@@ -27,6 +26,7 @@ on:
         options:
           - Release
           - Debug
+  workflow_call:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
