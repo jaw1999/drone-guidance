@@ -85,25 +85,48 @@ class VehicleState:
 class MockVehicle:
     """Simulates a MAVLink vehicle."""
 
-    def __init__(self, system_id=1, component_id=1):
+    def __init__(self, system_id=1, component_id=1, vehicle_type="copter"):
         self.system_id = system_id
         self.component_id = component_id
         self.state = VehicleState()
         self.running = False
         self.connection = None
         self.start_time = time.time()
+        self.vehicle_type = vehicle_type
 
-        # Mode mapping
-        self.modes = {
-            "STABILIZE": 0,
-            "ACRO": 1,
-            "ALT_HOLD": 2,
-            "AUTO": 3,
-            "GUIDED": 4,
-            "LOITER": 5,
-            "RTL": 6,
-            "LAND": 9,
-        }
+        # Mode mapping depends on vehicle type
+        if vehicle_type == "plane":
+            self.mav_type = mavlink.MAV_TYPE_FIXED_WING
+            self.modes = {
+                "MANUAL": 0,
+                "CIRCLE": 1,
+                "STABILIZE": 2,
+                "TRAINING": 3,
+                "ACRO": 4,
+                "FBWA": 5,
+                "FBWB": 6,
+                "CRUISE": 7,
+                "AUTOTUNE": 8,
+                "AUTO": 10,
+                "RTL": 11,
+                "LOITER": 12,
+                "GUIDED": 15,
+            }
+            self.state.mode = "FBWA"
+            self.state.airspeed = 25.0
+            self.state.groundspeed = 25.0
+        else:
+            self.mav_type = mavlink.MAV_TYPE_QUADROTOR
+            self.modes = {
+                "STABILIZE": 0,
+                "ACRO": 1,
+                "ALT_HOLD": 2,
+                "AUTO": 3,
+                "GUIDED": 4,
+                "LOITER": 5,
+                "RTL": 6,
+                "LAND": 9,
+            }
 
     def connect_udp(self, host="127.0.0.1", port=14550):
         """Connect via UDP."""
@@ -132,7 +155,7 @@ class MockVehicle:
         custom_mode = self.modes.get(self.state.mode, 0)
 
         self.connection.mav.heartbeat_send(
-            mavlink.MAV_TYPE_QUADROTOR,
+            self.mav_type,
             mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA,
             base_mode,
             custom_mode,
@@ -401,6 +424,7 @@ def main():
     parser.add_argument("--system-id", type=int, default=1, help="MAVLink system ID (default: 1)")
     parser.add_argument("--rate", type=int, default=10, help="Telemetry rate in Hz (default: 10)")
     parser.add_argument("--sitl", action="store_true", help="SITL-compatible mode (TCP on 5760)")
+    parser.add_argument("--plane", action="store_true", help="Simulate ArduPlane instead of ArduCopter")
     parser.add_argument(
         "--lat",
         type=float,
@@ -422,7 +446,8 @@ def main():
 
     args = parser.parse_args()
 
-    vehicle = MockVehicle(system_id=args.system_id)
+    vehicle_type = "plane" if args.plane else "copter"
+    vehicle = MockVehicle(system_id=args.system_id, vehicle_type=vehicle_type)
 
     # Override location from CLI if provided
     if args.lat is not None:
@@ -432,6 +457,7 @@ def main():
     if args.alt is not None:
         vehicle.state.alt = args.alt
 
+    print(f"Vehicle type: {'ArduPlane' if args.plane else 'ArduCopter'}")
     print(
         f"Initial position: {vehicle.state.lat:.4f}, {vehicle.state.lon:.4f} @ {vehicle.state.alt:.0f}m"
     )

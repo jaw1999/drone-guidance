@@ -13,8 +13,10 @@ Functions:
 """
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any, Tuple
 
+import psutil
 from flask import Flask, Response, jsonify, render_template_string, request
 
 if TYPE_CHECKING:
@@ -674,6 +676,68 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
         """Clear emergency stop state."""
         guidance.clear_emergency()
         return api_response(True)
+
+    @app.route("/api/health")
+    def health_check() -> Response:
+        """Health check endpoint for monitoring and load balancers.
+
+        Returns system health metrics including:
+        - CPU usage and temperature
+        - Memory usage
+        - Disk usage
+        - Component status (detector, MAVLink, tracking)
+        """
+        try:
+            # System metrics
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            memory = psutil.virtual_memory()
+            disk = psutil.disk_usage("/")
+
+            # Try to get CPU temperature (Pi-specific)
+            cpu_temp = None
+            try:
+                temps = psutil.sensors_temperatures()
+                if "cpu_thermal" in temps:
+                    cpu_temp = temps["cpu_thermal"][0].current
+                elif "coretemp" in temps:
+                    cpu_temp = temps["coretemp"][0].current
+            except Exception:
+                pass
+
+            # Component health from guidance status
+            status = guidance.get_status()
+
+            health = {
+                "status": "healthy",
+                "timestamp": time.time(),
+                "system": {
+                    "cpu_percent": cpu_percent,
+                    "cpu_temp_c": cpu_temp,
+                    "memory_percent": memory.percent,
+                    "memory_available_mb": memory.available // (1024 * 1024),
+                    "disk_percent": disk.percent,
+                },
+                "components": {
+                    "detector": status.get("detector", {}).get("initialized", False),
+                    "mavlink": status.get("mavlink", {}).get("connected", False),
+                    "tracking": status.get("tracking", {}).get("locked", False),
+                },
+                "uptime_seconds": time.time() - getattr(app, "_start_time", time.time()),
+            }
+
+            # Determine overall health status
+            if cpu_percent > 90 or memory.percent > 90:
+                health["status"] = "degraded"
+            if cpu_temp and cpu_temp > 80:
+                health["status"] = "degraded"
+
+            return jsonify(health)
+        except Exception as e:
+            logger.error(f"Health check error: {e}")
+            return jsonify({"status": "unhealthy", "error": str(e)}), 500
+
+    # Store app start time for uptime calculation
+    app._start_time = time.time()
 
     return app
 

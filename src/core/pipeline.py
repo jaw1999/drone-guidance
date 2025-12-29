@@ -48,32 +48,22 @@ class PipelineConfig:
     """Pipeline configuration."""
     detection_interval: int = 3
     detection_width: int = 640
-    detection_height: int = 480
-    roi_enabled: bool = True
-    roi_padding_percent: float = 50.0
+    detection_height: int = 640
     queue_size: int = 4
 
     @classmethod
     def from_dict(cls, config: dict) -> "PipelineConfig":
         det = config.get("detector", {})
         det_res = det.get("detection_resolution", {})
-        roi = det.get("roi_detection", {})
         return cls(
             detection_interval=det.get("detection_interval", 3),
             detection_width=det_res.get("width", 640),
-            detection_height=det_res.get("height", 480),
-            roi_enabled=roi.get("enabled", True),
-            roi_padding_percent=roi.get("padding_percent", 50.0),
+            detection_height=det_res.get("height", 640),
         )
 
 
 class DetectionWorker:
-    """Background thread for running object detection.
-
-    Supports ROI-based detection for improved performance when a target
-    is locked. When ROI is set, detection is run on a cropped region
-    around the target, significantly reducing inference time.
-    """
+    """Background thread for running object detection."""
 
     def __init__(
         self,
@@ -83,15 +73,10 @@ class DetectionWorker:
         self.detector = detector
         self.config = config
 
-        # Increased queue sizes for smoother operation
         self._input_queue: Queue[Tuple[FrameData, Tuple[int, int]]] = Queue(maxsize=4)
         self._output_queue: Queue[FrameData] = Queue(maxsize=4)
         self._running = False
         self._thread: Optional[threading.Thread] = None
-
-        # ROI state for cropped detection
-        self._last_roi: Optional[Tuple[int, int, int, int]] = None
-        self._roi_lock = threading.Lock()
 
     @property
     def output_queue(self) -> Queue[FrameData]:
@@ -110,33 +95,15 @@ class DetectionWorker:
         logger.info("Detection worker stopped")
 
     def submit(self, frame_data: FrameData, orig_size: Tuple[int, int]) -> bool:
-        """Submit frame for detection.
-
-        Args:
-            frame_data: Frame data (can be full-size or pre-downscaled)
-            orig_size: Original frame (height, width) for scaling results back
-
-        Returns:
-            True if submitted, False if queue full
-        """
+        """Submit frame for detection."""
         try:
             self._input_queue.put_nowait((frame_data, orig_size))
             return True
         except Full:
             return False
 
-    def set_roi(self, bbox: Optional[Tuple[int, int, int, int]]) -> None:
-        """Set ROI for next detection based on target bbox (thread-safe)."""
-        with self._roi_lock:
-            self._last_roi = bbox
-
-    def _get_roi(self) -> Optional[Tuple[int, int, int, int]]:
-        """Get current ROI (thread-safe)."""
-        with self._roi_lock:
-            return self._last_roi
-
     def _run(self) -> None:
-        """Main detection loop with ROI support."""
+        """Main detection loop."""
         while self._running:
             try:
                 item = self._input_queue.get(timeout=0.1)
@@ -157,45 +124,6 @@ class DetectionWorker:
 
                 orig_h, orig_w = orig_size if orig_size else (det_h, det_w)
 
-                # Check for ROI-based detection
-                roi = self._get_roi()
-                roi_offset_x, roi_offset_y = 0, 0
-
-                if roi and self.config.roi_enabled:
-                    # Calculate padded ROI for detection
-                    rx1, ry1, rx2, ry2 = roi
-                    roi_w = rx2 - rx1
-                    roi_h = ry2 - ry1
-
-                    # Add padding around ROI
-                    pad = self.config.roi_padding_percent / 100.0
-                    pad_x = int(roi_w * pad)
-                    pad_y = int(roi_h * pad)
-
-                    # Calculate padded ROI bounds (in original frame coords)
-                    px1 = max(0, rx1 - pad_x)
-                    py1 = max(0, ry1 - pad_y)
-                    px2 = min(orig_w, rx2 + pad_x)
-                    py2 = min(orig_h, ry2 + pad_y)
-
-                    # Scale ROI coords to detection frame
-                    scale_to_det_x = det_w / orig_w
-                    scale_to_det_y = det_h / orig_h
-                    crop_x1 = int(px1 * scale_to_det_x)
-                    crop_y1 = int(py1 * scale_to_det_y)
-                    crop_x2 = int(px2 * scale_to_det_x)
-                    crop_y2 = int(py2 * scale_to_det_y)
-
-                    # Ensure minimum crop size
-                    if crop_x2 - crop_x1 >= 64 and crop_y2 - crop_y1 >= 64:
-                        frame = frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                        roi_offset_x = px1
-                        roi_offset_y = py1
-                        det_h, det_w = frame.shape[:2]
-                        # Update scale factors for cropped region
-                        orig_h = py2 - py1
-                        orig_w = px2 - px1
-
                 # Calculate scale factors
                 scale_x = orig_w / max(1, det_w)
                 scale_y = orig_h / max(1, det_h)
@@ -209,11 +137,10 @@ class DetectionWorker:
                 scaled_detections = []
                 for det in detections:
                     x1, y1, x2, y2 = det.bbox
-                    # Scale and add ROI offset
-                    sx1 = int(x1 * scale_x) + roi_offset_x
-                    sy1 = int(y1 * scale_y) + roi_offset_y
-                    sx2 = int(x2 * scale_x) + roi_offset_x
-                    sy2 = int(y2 * scale_y) + roi_offset_y
+                    sx1 = int(x1 * scale_x)
+                    sy1 = int(y1 * scale_y)
+                    sx2 = int(x2 * scale_x)
+                    sy2 = int(y2 * scale_y)
                     cx = (sx1 + sx2) // 2
                     cy = (sy1 + sy2) // 2
 
@@ -417,12 +344,6 @@ class Pipeline:
         should_detect = frames_since_detect >= self.config.detection_interval
 
         if should_detect:
-            # Set ROI based on current locked target
-            if self.tracker.locked_target:
-                self._detection_worker.set_roi(self.tracker.locked_target.bbox)
-            else:
-                self._detection_worker.set_roi(None)
-
             # Submit for async detection - downscale now to reduce memory copy
             det_w, det_h = self.config.detection_width, self.config.detection_height
             detect_frame = cv2.resize(frame, (det_w, det_h))

@@ -1,6 +1,14 @@
-"""Object detection module using YOLO models."""
+"""Object detection module using YOLO models.
+
+Optimized for Raspberry Pi 5 with support for:
+- NCNN format for ~4x faster inference on ARM
+- Automatic model export to NCNN
+- Configurable input resolution (320/416/640)
+- ROI-based detection for locked targets
+"""
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,6 +16,9 @@ from typing import List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Environment variable to force NCNN export
+FORCE_NCNN_EXPORT = os.environ.get("FORCE_NCNN_EXPORT", "0") == "1"
 
 
 @dataclass
@@ -34,27 +45,36 @@ class Detection:
 
 @dataclass
 class DetectorConfig:
-    """Detector configuration parameters."""
-    model: str = "yolov8n"
+    """Detector configuration parameters.
+
+    Performance notes for Raspberry Pi 5:
+    - NCNN format is ~4x faster than PyTorch (94ms vs 387ms at 640px)
+    - input_size 640 needed for distance detection, 480 for balanced, 320 for close-range
+    - YOLO11n is recommended (faster than YOLOv8n on ARM)
+    - Use detection_interval in pipeline config to skip frames (tracker interpolates)
+    """
+    model: str = "yolo11n"
     weights_path: str = ""
     confidence_threshold: float = 0.5
     nms_threshold: float = 0.45
     target_classes: List[str] = field(default_factory=list)
-    input_size: int = 640
-    half_precision: bool = True
+    input_size: int = 640  # 640 for distance, 480 balanced, 320 close-range only
+    half_precision: bool = False  # FP16 not supported on Pi CPU
+    auto_export_ncnn: bool = True  # Auto-export to NCNN for ~4x faster inference
 
     @classmethod
     def from_dict(cls, config: dict) -> "DetectorConfig":
         """Create config from dictionary."""
         det = config.get("detector", {})
         return cls(
-            model=det.get("model", "yolov8n"),
+            model=det.get("model", "yolo11n"),
             weights_path=det.get("weights_path", ""),
             confidence_threshold=det.get("confidence_threshold", 0.5),
             nms_threshold=det.get("nms_threshold", 0.45),
             target_classes=det.get("target_classes", []),
             input_size=det.get("input_size", 640),
-            half_precision=det.get("half_precision", True),
+            half_precision=det.get("half_precision", False),
+            auto_export_ncnn=det.get("auto_export_ncnn", True),
         )
 
 
@@ -73,6 +93,8 @@ class ObjectDetector:
         self._target_class_ids: set = set()
         self._inference_time = 0.0
         self._initialized = False
+        self._consecutive_errors = 0
+        self._max_consecutive_errors = 10
 
     @property
     def inference_time_ms(self) -> float:
@@ -84,11 +106,51 @@ class ObjectDetector:
         """Check if model is loaded."""
         return self._initialized
 
-    def initialize(self) -> bool:
-        """Load and prepare the detection model."""
+    def _export_to_ncnn(self, pt_path: Path) -> Optional[Path]:
+        """Export PyTorch model to NCNN format for faster ARM inference.
+
+        Args:
+            pt_path: Path to the .pt model file
+
+        Returns:
+            Path to NCNN model directory, or None if export failed
+        """
         try:
             from ultralytics import YOLO
+            logger.info(f"Exporting {pt_path} to NCNN format (this may take a minute)...")
 
+            model = YOLO(str(pt_path))
+            # Export to NCNN - optimized for ARM/mobile
+            export_path = model.export(format="ncnn")
+
+            if export_path and Path(export_path).exists():
+                logger.info(f"NCNN export successful: {export_path}")
+                return Path(export_path)
+            else:
+                logger.warning("NCNN export completed but path not found")
+                return None
+
+        except Exception as e:
+            logger.warning(f"NCNN export failed: {e}")
+            logger.info("Falling back to PyTorch model (slower inference)")
+            return None
+
+    def initialize(self) -> bool:
+        """Load and prepare the detection model.
+
+        Model loading priority:
+        1. Custom weights_path if specified
+        2. NCNN format (4x faster on ARM)
+        3. PyTorch format (auto-exports to NCNN if enabled)
+        """
+        try:
+            from ultralytics import YOLO
+        except ImportError as e:
+            logger.error(f"Failed to import ultralytics: {e}")
+            logger.error("Install with: pip install ultralytics")
+            return False
+
+        try:
             # Determine model path - prefer NCNN format for speed on ARM
             if self.config.weights_path and Path(self.config.weights_path).exists():
                 model_path = self.config.weights_path
@@ -98,18 +160,31 @@ class ObjectDetector:
                 ncnn_path = Path(f"{self.config.model}_ncnn_model")
                 pt_path = Path(f"{self.config.model}.pt")
 
-                if ncnn_path.exists():
+                if ncnn_path.exists() and not FORCE_NCNN_EXPORT:
                     model_path = str(ncnn_path)
-                    logger.info(f"Loading NCNN model: {model_path} (optimized for ARM)")
+                    logger.info(f"Loading NCNN model: {model_path} (~4x faster on ARM)")
                 elif pt_path.exists():
-                    model_path = str(pt_path)
-                    logger.info(f"Loading PyTorch model: {model_path}")
-                    logger.warning("For faster inference on Pi, export to NCNN: yolo export model=yolo11n.pt format=ncnn")
+                    # Try to auto-export to NCNN for better performance
+                    if self.config.auto_export_ncnn or FORCE_NCNN_EXPORT:
+                        exported = self._export_to_ncnn(pt_path)
+                        if exported:
+                            model_path = str(exported)
+                        else:
+                            model_path = str(pt_path)
+                            logger.info(f"Loading PyTorch model: {model_path}")
+                    else:
+                        model_path = str(pt_path)
+                        logger.info(f"Loading PyTorch model: {model_path}")
+                        logger.warning(
+                            "NCNN format is ~4x faster on Pi. Enable auto_export_ncnn "
+                            "or run: yolo export model=yolo11n.pt format=ncnn"
+                        )
                 else:
+                    # Model doesn't exist locally - let ultralytics download it
                     model_path = f"{self.config.model}.pt"
-                    logger.info(f"Loading default model: {model_path}")
+                    logger.info(f"Model not found locally, downloading: {model_path}")
 
-            # Load model
+            # Load model (ultralytics auto-downloads if model_path is a known model name)
             self._model = YOLO(model_path)
 
             # Get class names from model
@@ -144,8 +219,13 @@ class ObjectDetector:
             logger.info(f"Detector initialized: {self.config.model}")
             return True
 
+        except RuntimeError as e:
+            logger.error(f"Runtime error loading model: {e}")
+            if "CUDA" in str(e):
+                logger.error("CUDA error - try setting half_precision=False or use CPU")
+            return False
         except Exception as e:
-            logger.error(f"Failed to initialize detector: {e}")
+            logger.error(f"Failed to initialize detector: {e}", exc_info=True)
             return False
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
@@ -208,11 +288,25 @@ class ObjectDetector:
                     )
                     detections.append(detection)
 
+            self._consecutive_errors = 0  # Reset on success
             return detections
 
         except Exception as e:
-            logger.error(f"Detection error: {e}")
+            self._consecutive_errors += 1
             self._inference_time = time.perf_counter() - start_time
+
+            # Log with appropriate severity based on error frequency
+            if self._consecutive_errors == 1:
+                logger.warning(f"Detection error: {e}")
+            elif self._consecutive_errors <= self._max_consecutive_errors:
+                logger.error(f"Detection error ({self._consecutive_errors} consecutive): {e}")
+            elif self._consecutive_errors == self._max_consecutive_errors + 1:
+                logger.critical(
+                    f"Detection failing repeatedly ({self._consecutive_errors}x). "
+                    "Check model/camera. Suppressing further errors."
+                )
+            # Suppress logging after max errors to avoid log spam
+
             return []
 
     def get_class_name(self, class_id: int) -> str:

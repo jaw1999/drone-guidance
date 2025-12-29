@@ -152,8 +152,11 @@ run_rsync -avz --progress \
     --exclude '*.onnx' \
     --exclude 'runs/' \
     --exclude 'qgc/' \
+    --exclude 'sitl/' \
     --exclude '.claude' \
     --exclude 'logs/' \
+    --exclude 'videos/' \
+    --exclude '*.ulg' \
     -e "ssh $SSH_OPTS" \
     "$PROJECT_DIR/" "${PI_TARGET}:${REMOTE_PATH}/"
 

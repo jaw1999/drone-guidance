@@ -151,20 +151,42 @@ class PIDController:
         self._dead_zone = value
 
     def update_gains(self, axis: str, kp: float = None, ki: float = None,
-                     kd: float = None, max_rate: float = None) -> None:
-        """Update gains for a specific axis."""
+                     kd: float = None, max_rate: float = None,
+                     reset_integral: bool = True) -> None:
+        """Update gains for a specific axis.
+
+        Args:
+            axis: The axis to update ('yaw', 'pitch', or 'throttle')
+            kp: New proportional gain (optional)
+            ki: New integral gain (optional)
+            kd: New derivative gain (optional)
+            max_rate: New maximum output rate (optional)
+            reset_integral: Whether to reset integral term (default True)
+        """
         pid_axis = {"yaw": self._yaw, "pitch": self._pitch, "throttle": self._throttle}.get(axis)
         if not pid_axis:
+            logger.warning(f"Unknown PID axis: {axis}")
             return
+
         if kp is not None:
             pid_axis.gains.kp = kp
         if ki is not None:
             pid_axis.gains.ki = ki
+            # Update anti-windup limit when ki changes
+            pid_axis._integral_limit = pid_axis.gains.max_output / (ki if ki > 0 else 1.0)
         if kd is not None:
             pid_axis.gains.kd = kd
         if max_rate is not None:
             pid_axis.gains.max_output = max_rate
-        logger.info(f"Updated {axis} PID gains: kp={pid_axis.gains.kp}, ki={pid_axis.gains.ki}, kd={pid_axis.gains.kd}")
+            # Update anti-windup limit when max_output changes
+            pid_axis._integral_limit = max_rate / (pid_axis.gains.ki if pid_axis.gains.ki > 0 else 1.0)
+
+        # Reset integral to prevent windup issues from old accumulated error
+        if reset_integral:
+            pid_axis.reset()
+            logger.info(f"Updated {axis} PID gains and reset integral: kp={pid_axis.gains.kp}, ki={pid_axis.gains.ki}, kd={pid_axis.gains.kd}")
+        else:
+            logger.info(f"Updated {axis} PID gains: kp={pid_axis.gains.kp}, ki={pid_axis.gains.ki}, kd={pid_axis.gains.kd}")
 
     def enable(self) -> None:
         """Enable control output."""

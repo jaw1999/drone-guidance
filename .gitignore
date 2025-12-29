@@ -31,6 +31,9 @@ Thumbs.db
 # QGC build artifacts
 qgc/qgroundcontrol/build/
 
+# SITL (Software In The Loop) simulation files
+sitl/
+
 # Large files - exclude from repo
 videos/*.mp4
 *.ulg
