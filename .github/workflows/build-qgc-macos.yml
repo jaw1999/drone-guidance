@@ -29,8 +29,8 @@ on:
   workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -150,13 +150,23 @@ jobs:
           QGC_MACOS_NOTARIZATION_PASSWORD: ${{ secrets.MACOS_NOTARIZATION_PASSWORD }}
           QGC_MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.MACOS_NOTARIZATION_TEAM_ID }}
 
+      - name: List build artifacts
+        working-directory: ${{ runner.temp }}/build
+        run: |
+          echo "=== Listing all .dmg files ==="
+          find . -name "*.dmg" -type f 2>/dev/null || true
+          echo "=== Listing root build directory ==="
+          ls -la . || true
+
       - name: Rename artifact
         working-directory: ${{ runner.temp }}/build
         run: |
-          if [ -f "QGroundControl.dmg" ]; then
-            mv QGroundControl.dmg DroneGuidance-QGC-macOS.dmg
-          elif [ -f "Custom-QGroundControl.dmg" ]; then
-            mv Custom-QGroundControl.dmg DroneGuidance-QGC-macOS.dmg
+          DMG=$(find . -maxdepth 1 -name "*.dmg" | head -1)
+          if [ -n "$DMG" ]; then
+            echo "Found DMG: $DMG"
+            mv "$DMG" DroneGuidance-QGC-macOS.dmg
+          else
+            echo "WARNING: No .dmg files found"
           fi
 
       - name: Upload artifact

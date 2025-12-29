@@ -29,8 +29,8 @@ on:
   workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -156,14 +156,33 @@ jobs:
         working-directory: ${{ runner.temp }}/build
         run: cmake --install . --config ${{ matrix.build_type }}
 
+      - name: List build artifacts
+        shell: bash
+        working-directory: ${{ runner.temp }}/build
+        run: |
+          echo "=== Listing all .exe files ==="
+          find . -name "*.exe" -type f 2>/dev/null || true
+          echo "=== Listing root build directory ==="
+          ls -la . || true
+
       - name: Rename artifact
         shell: bash
         working-directory: ${{ runner.temp }}/build
         run: |
-          if [ -f "QGroundControl-installer.exe" ]; then
-            mv QGroundControl-installer.exe ${{ matrix.package }}.exe
-          elif [ -f "Custom-QGroundControl-installer.exe" ]; then
-            mv Custom-QGroundControl-installer.exe ${{ matrix.package }}.exe
+          # Find any installer exe
+          INSTALLER=$(find . -maxdepth 1 -name "*installer*.exe" -o -name "*Installer*.exe" | head -1)
+          if [ -n "$INSTALLER" ]; then
+            echo "Found installer: $INSTALLER"
+            mv "$INSTALLER" ${{ matrix.package }}.exe
+          else
+            echo "No installer found, checking for any .exe"
+            EXE=$(find . -maxdepth 1 -name "*.exe" | head -1)
+            if [ -n "$EXE" ]; then
+              echo "Found exe: $EXE"
+              cp "$EXE" ${{ matrix.package }}.exe
+            else
+              echo "WARNING: No .exe files found in build directory"
+            fi
           fi
 
       - name: Upload artifact

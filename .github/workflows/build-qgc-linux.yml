@@ -29,8 +29,8 @@ on:
   workflow_call:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -166,13 +166,24 @@ jobs:
         working-directory: ${{ runner.temp }}/build
         run: cmake --install . --config ${{ matrix.build_type }}
 
+      - name: List build artifacts
+        working-directory: ${{ runner.temp }}/build
+        run: |
+          echo "=== Listing all .AppImage files ==="
+          find . -name "*.AppImage" -type f 2>/dev/null || true
+          echo "=== Listing root build directory ==="
+          ls -la . || true
+
       - name: Rename artifact
         working-directory: ${{ runner.temp }}/build
         run: |
           # Find the AppImage file (could be QGroundControl or Custom-QGroundControl)
           APPIMAGE=$(find . -maxdepth 1 -name "*.AppImage" | head -1)
           if [ -n "$APPIMAGE" ]; then
+            echo "Found AppImage: $APPIMAGE"
             mv "$APPIMAGE" ${{ matrix.package }}.AppImage
+          else
+            echo "WARNING: No .AppImage files found"
           fi
 
       - name: Upload artifact
