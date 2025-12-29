@@ -13,26 +13,40 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
-  build-all:
-    name: Build All Platforms
+  build-linux:
+    name: Build Linux
     uses: ./.github/workflows/build-qgc-linux.yml
     secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
   build-macos:
     name: Build macOS
     uses: ./.github/workflows/build-qgc-macos.yml
     secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
   build-windows:
     name: Build Windows
     uses: ./.github/workflows/build-qgc-windows.yml
     secrets: inherit
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
 
   create-release:
     name: Create GitHub Release
-    needs: [build-all, build-macos, build-windows]
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
