@@ -426,7 +426,7 @@ CONFIG_PAGE = """
         function parseConnection(conn) {
             // Parse "udp:IP:PORT" or "udpci:IP:PORT" format
             if (!conn) return { ip: '', port: 14550 };
-            const match = conn.match(/^(?:udp(?:ci)?:)?([^:]+):(\d+)$/i);
+            const match = conn.match(/^(?:udp(?:ci)?:)?([^:]+):(\\d+)$/i);
             if (match) return { ip: match[1], port: parseInt(match[2]) };
             return { ip: conn, port: 14550 };
         }
@@ -621,9 +621,39 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
     @app.route("/api/config", methods=["POST"])
     def update_config() -> Tuple[Response, int]:
         """Update configuration with provided values."""
-        new_config = request.get_json()
+        try:
+            new_config = request.get_json()
+        except Exception:
+            return api_response(False, message="Invalid JSON", status=400)
+
         if not new_config:
             return api_response(False, message="No config provided", status=400)
+
+        if not isinstance(new_config, dict):
+            return api_response(False, message="Config must be a JSON object", status=400)
+
+        # Validate and sanitize nested config (limit depth to prevent DoS)
+        def validate_config(obj, depth=0):
+            if depth > 5:
+                raise ValueError("Config too deeply nested")
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if not isinstance(k, str):
+                        raise ValueError("Config keys must be strings")
+                    validate_config(v, depth + 1)
+            elif isinstance(obj, list):
+                if len(obj) > 100:
+                    raise ValueError("Config arrays too large")
+                for item in obj:
+                    validate_config(item, depth + 1)
+            elif not isinstance(obj, (str, int, float, bool, type(None))):
+                raise ValueError(f"Invalid config value type: {type(obj)}")
+
+        try:
+            validate_config(new_config)
+        except ValueError as e:
+            return api_response(False, message=str(e), status=400)
+
         if guidance.update_config(new_config):
             return api_response(True, message="Configuration updated")
         return api_response(False, message="Failed to update config", status=400)
@@ -634,8 +664,16 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
         data = request.get_json() or {}
         target_id = data.get("target_id")
         if target_id is not None:
-            if guidance.lock_target(int(target_id)):
-                return api_response(True, {"target_id": target_id})
+            # Validate target_id is a valid integer
+            try:
+                target_id_int = int(target_id)
+                if target_id_int < 0:
+                    return api_response(False, message="Invalid target ID", status=400)
+            except (ValueError, TypeError):
+                return api_response(False, message="Invalid target ID format", status=400)
+
+            if guidance.lock_target(target_id_int):
+                return api_response(True, {"target_id": target_id_int})
             return api_response(False, message="Target not found", status=404)
         if guidance.auto_lock():
             return api_response(True, message="Auto-locked")

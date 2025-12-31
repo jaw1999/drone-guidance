@@ -1,14 +1,17 @@
 """Object detection module using YOLO models.
 
 Optimized for Raspberry Pi 5 with support for:
-- NCNN format for ~4x faster inference on ARM
-- Automatic model export to NCNN
+- NCNN format (best for Pi 5 real-time, ~130ms at 640px)
+- OpenVINO format (better throughput, worse latency due to batch mode)
 - Configurable input resolution (320/416/640)
 - ROI-based detection for locked targets
 """
 
-import logging
+# CRITICAL: Set OpenMP threads BEFORE any imports (NumPy, NCNN, etc.)
 import os
+os.environ["OMP_NUM_THREADS"] = "4"
+
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,8 +20,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Environment variable to force NCNN export
-FORCE_NCNN_EXPORT = os.environ.get("FORCE_NCNN_EXPORT", "0") == "1"
+# Environment variable to force model re-export
+FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
 
 
 @dataclass
@@ -48,7 +51,8 @@ class DetectorConfig:
     """Detector configuration parameters.
 
     Performance notes for Raspberry Pi 5:
-    - NCNN format is ~4x faster than PyTorch (94ms vs 387ms at 640px)
+    - NCNN is best for real-time (~130ms at 640px with FP16)
+    - OpenVINO has worse latency due to batch mode (~200ms)
     - input_size 640 needed for distance detection, 480 for balanced, 320 for close-range
     - YOLO11n is recommended (faster than YOLOv8n on ARM)
     - Use detection_interval in pipeline config to skip frames (tracker interpolates)
@@ -60,7 +64,7 @@ class DetectorConfig:
     target_classes: List[str] = field(default_factory=list)
     input_size: int = 640  # 640 for distance, 480 balanced, 320 close-range only
     half_precision: bool = False  # FP16 not supported on Pi CPU
-    auto_export_ncnn: bool = True  # Auto-export to NCNN for ~4x faster inference
+    backend: str = "ncnn"  # "ncnn" (best for Pi 5), "openvino", or "pytorch"
 
     @classmethod
     def from_dict(cls, config: dict) -> "DetectorConfig":
@@ -74,7 +78,7 @@ class DetectorConfig:
             target_classes=det.get("target_classes", []),
             input_size=det.get("input_size", 640),
             half_precision=det.get("half_precision", False),
-            auto_export_ncnn=det.get("auto_export_ncnn", True),
+            backend=det.get("backend", "ncnn"),
         )
 
 
@@ -106,32 +110,38 @@ class ObjectDetector:
         """Check if model is loaded."""
         return self._initialized
 
-    def _export_to_ncnn(self, pt_path: Path) -> Optional[Path]:
-        """Export PyTorch model to NCNN format for faster ARM inference.
+    def _export_model(self, pt_path: Path, backend: str) -> Optional[Path]:
+        """Export PyTorch model to optimized format for faster inference.
 
         Args:
             pt_path: Path to the .pt model file
+            backend: Target format ("openvino" or "ncnn")
 
         Returns:
-            Path to NCNN model directory, or None if export failed
+            Path to exported model, or None if export failed
         """
         try:
             from ultralytics import YOLO
-            logger.info(f"Exporting {pt_path} to NCNN format (this may take a minute)...")
+            logger.info(f"Exporting {pt_path} to {backend.upper()} format (this may take a minute)...")
 
             model = YOLO(str(pt_path))
-            # Export to NCNN - optimized for ARM/mobile
-            export_path = model.export(format="ncnn")
+
+            if backend == "openvino":
+                # OpenVINO is fastest on Pi 5 (~80ms vs 130ms NCNN)
+                export_path = model.export(format="openvino")
+            else:
+                # NCNN fallback, half precision for speed
+                export_path = model.export(format="ncnn", half=True)
 
             if export_path and Path(export_path).exists():
-                logger.info(f"NCNN export successful: {export_path}")
+                logger.info(f"{backend.upper()} export successful: {export_path}")
                 return Path(export_path)
             else:
-                logger.warning("NCNN export completed but path not found")
+                logger.warning(f"{backend.upper()} export completed but path not found")
                 return None
 
         except Exception as e:
-            logger.warning(f"NCNN export failed: {e}")
+            logger.warning(f"{backend.upper()} export failed: {e}")
             logger.info("Falling back to PyTorch model (slower inference)")
             return None
 
@@ -140,8 +150,9 @@ class ObjectDetector:
 
         Model loading priority:
         1. Custom weights_path if specified
-        2. NCNN format (4x faster on ARM)
-        3. PyTorch format (auto-exports to NCNN if enabled)
+        2. OpenVINO format (fastest on Pi 5, ~80ms)
+        3. NCNN format (fallback, ~130ms)
+        4. PyTorch format (auto-exports to preferred backend)
         """
         try:
             from ultralytics import YOLO
@@ -151,22 +162,28 @@ class ObjectDetector:
             return False
 
         try:
-            # Determine model path - prefer NCNN format for speed on ARM
+            # Determine model path - prefer optimized formats for speed
             if self.config.weights_path and Path(self.config.weights_path).exists():
                 model_path = self.config.weights_path
                 logger.info(f"Loading custom weights: {model_path}")
             else:
-                # Check for NCNN format first (much faster on Pi)
-                ncnn_path = Path(f"{self.config.model}_ncnn_model")
+                backend = self.config.backend.lower()
                 pt_path = Path(f"{self.config.model}.pt")
 
-                if ncnn_path.exists() and not FORCE_NCNN_EXPORT:
+                # Check for pre-exported models
+                openvino_path = Path(f"{self.config.model}_openvino_model")
+                ncnn_path = Path(f"{self.config.model}_ncnn_model")
+
+                if backend == "openvino" and openvino_path.exists() and not FORCE_EXPORT:
+                    model_path = str(openvino_path)
+                    logger.info(f"Loading OpenVINO model: {model_path} (fastest on Pi 5)")
+                elif backend == "ncnn" and ncnn_path.exists() and not FORCE_EXPORT:
                     model_path = str(ncnn_path)
-                    logger.info(f"Loading NCNN model: {model_path} (~4x faster on ARM)")
+                    logger.info(f"Loading NCNN model: {model_path}")
                 elif pt_path.exists():
-                    # Try to auto-export to NCNN for better performance
-                    if self.config.auto_export_ncnn or FORCE_NCNN_EXPORT:
-                        exported = self._export_to_ncnn(pt_path)
+                    # Auto-export to preferred backend
+                    if backend in ("openvino", "ncnn"):
+                        exported = self._export_model(pt_path, backend)
                         if exported:
                             model_path = str(exported)
                         else:
@@ -175,10 +192,6 @@ class ObjectDetector:
                     else:
                         model_path = str(pt_path)
                         logger.info(f"Loading PyTorch model: {model_path}")
-                        logger.warning(
-                            "NCNN format is ~4x faster on Pi. Enable auto_export_ncnn "
-                            "or run: yolo export model=yolo11n.pt format=ncnn"
-                        )
                 else:
                     # Model doesn't exist locally - let ultralytics download it
                     model_path = f"{self.config.model}.pt"
@@ -206,6 +219,7 @@ class ObjectDetector:
                 self._target_class_ids = set(range(len(self._class_names)))
 
             # Warm up model with dummy inference
+            logger.info("Warming up model...")
             dummy = np.zeros((self.config.input_size, self.config.input_size, 3), dtype=np.uint8)
             self._model.predict(
                 dummy,
@@ -213,7 +227,10 @@ class ObjectDetector:
                 conf=self.config.confidence_threshold,
                 half=self.config.half_precision,
                 verbose=False,
+                device='cpu',
+                max_det=30,
             )
+            logger.info("Warmup complete")
 
             self._initialized = True
             logger.info(f"Detector initialized: {self.config.model}")
@@ -228,12 +245,13 @@ class ObjectDetector:
             logger.error(f"Failed to initialize detector: {e}", exc_info=True)
             return False
 
-    def detect(self, frame: np.ndarray) -> List[Detection]:
+    def detect(self, frame: np.ndarray, roi: Optional[tuple] = None) -> List[Detection]:
         """
         Run detection on a frame.
 
         Args:
             frame: BGR image as numpy array
+            roi: Optional (x1, y1, x2, y2) region of interest for faster detection
 
         Returns:
             List of Detection objects
@@ -242,15 +260,34 @@ class ObjectDetector:
             logger.warning("Detector not initialized")
             return []
 
+        # DEBUG: Log frame info first time
+        if not hasattr(self, '_frame_logged'):
+            logger.info(f"[DETECTOR] Frame: shape={frame.shape}, dtype={frame.dtype}, size={frame.nbytes/1024/1024:.1f}MB, contiguous={frame.flags['C_CONTIGUOUS']}")
+            self._frame_logged = True
+
         start_time = time.perf_counter()
 
+        # ROI optimization: if provided, only process cropped region
+        roi_offset = (0, 0)
+        if roi is not None:
+            x1, y1, x2, y2 = roi
+            # Ensure ROI is within frame bounds
+            h, w = frame.shape[:2]
+            x1 = max(0, min(x1, w))
+            y1 = max(0, min(y1, h))
+            x2 = max(x1, min(x2, w))
+            y2 = max(y1, min(y2, h))
+
+            frame = frame[y1:y2, x1:x2]
+            roi_offset = (x1, y1)
+
         try:
-            results = self._model.predict(
+            # Minimal predict call for maximum speed
+            results = self._model(
                 frame,
                 imgsz=self.config.input_size,
                 conf=self.config.confidence_threshold,
                 iou=self.config.nms_threshold,
-                half=self.config.half_precision,
                 verbose=False,
             )
 
@@ -258,35 +295,38 @@ class ObjectDetector:
 
             detections = []
             for result in results:
-                if result.boxes is None:
+                if result.boxes is None or len(result.boxes) == 0:
                     continue
 
+                # Get all detections at once
                 boxes = result.boxes.xyxy.cpu().numpy()
                 confs = result.boxes.conf.cpu().numpy()
                 class_ids = result.boxes.cls.cpu().numpy().astype(int)
 
+                # Vectorized filtering by target classes
+                mask = np.isin(class_ids, list(self._target_class_ids))
+                boxes = boxes[mask]
+                confs = confs[mask]
+                class_ids = class_ids[mask]
+
+                # Apply ROI offset if needed (vectorized)
+                if roi_offset != (0, 0):
+                    boxes[:, [0, 2]] += roi_offset[0]  # x coords
+                    boxes[:, [1, 3]] += roi_offset[1]  # y coords
+
+                # Build detection objects
                 for box, conf, class_id in zip(boxes, confs, class_ids):
-                    # Filter by target classes
-                    if class_id not in self._target_class_ids:
-                        continue
-
-                    # Validate class_id bounds
-                    if class_id < 0 or class_id >= len(self._class_names):
-                        logger.warning(f"Invalid class_id {class_id}, skipping")
-                        continue
-
                     x1, y1, x2, y2 = map(int, box)
                     cx = (x1 + x2) // 2
                     cy = (y1 + y2) // 2
 
-                    detection = Detection(
+                    detections.append(Detection(
                         class_id=int(class_id),
                         class_name=self._class_names[class_id],
                         confidence=float(conf),
                         bbox=(x1, y1, x2, y2),
                         center=(cx, cy),
-                    )
-                    detections.append(detection)
+                    ))
 
             self._consecutive_errors = 0  # Reset on success
             return detections

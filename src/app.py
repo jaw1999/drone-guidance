@@ -1,10 +1,14 @@
 """Main application for Terminal Guidance."""
 
 import logging
+import os
 import signal
 import sys
 import threading
 import time
+
+# Enable OpenMP multi-threading for NCNN (4 cores on Pi 5)
+os.environ.setdefault("OMP_NUM_THREADS", "4")
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -161,7 +165,7 @@ class TerminalGuidance:
                 # Get frame from camera
                 frame = self._camera.get_frame()
                 if frame is None:
-                    time.sleep(0.01)
+                    time.sleep(0.001)  # Reduced sleep for faster polling
                     continue
 
                 # Validate frame
@@ -175,6 +179,12 @@ class TerminalGuidance:
                 # Update metrics
                 self._fps = self._pipeline.fps
                 self._inference_ms = self._pipeline.inference_ms
+
+                # Debug: log FPS every 100 frames
+                if self._pipeline._frame_count % 100 == 0:
+                    loop_now = time.time()
+                    loop_ms = (loop_now - loop_start) * 1000
+                    logger.info(f"[PERF] Cam: {self._camera.actual_fps:.1f}, Pipe: {self._fps:.1f}, Inf: {self._inference_ms:.0f}ms, Loop: {loop_ms:.0f}ms, Frames: {self._pipeline._frame_count}")
 
                 # Get tracking state
                 locked_target = frame_data.locked_target
@@ -277,7 +287,7 @@ class TerminalGuidance:
                 time.sleep(0.1)  # Brief pause before retrying
                 continue
 
-            # Rate limiting - use cached target frame time
+            # Rate limiting to target FPS
             loop_time = time.time() - loop_start
             if loop_time < target_frame_time:
                 time.sleep(target_frame_time - loop_time)
@@ -428,12 +438,12 @@ class TerminalGuidance:
             # Restart MAVLink if connection changed
             if restart_mavlink and self._mavlink:
                 logger.info("Restarting MAVLink with new config...")
-                self._mavlink.disconnect()
+                self._mavlink.stop()
                 mav_config = MAVLinkConfig.from_dict(self.config)
                 safety_config = SafetyConfig.from_dict(self.config)
                 self._mavlink = MAVLinkController(mav_config, safety_config)
                 self._mavlink.set_tracking_command_callback(self._handle_tracking_command)
-                self._mavlink.connect()
+                self._mavlink.start()
 
             # Update PID parameters in-place (no restart needed)
             if "pid" in new_config and self._pid:

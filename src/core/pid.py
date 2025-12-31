@@ -52,22 +52,33 @@ class PIDConfig:
 class PIDAxis:
     """Single-axis PID controller with anti-windup."""
 
+    MIN_KI_FOR_LIMIT = 0.001  # Minimum ki to calculate meaningful integral limit
+
     def __init__(self, gains: PIDGains):
         self.gains = gains
         self._integral = 0.0
         self._prev_error = 0.0
+        self._prev_measurement = 0.0  # For derivative-on-measurement
         self._prev_time: Optional[float] = None
+        self._first_update = True
 
-        # Anti-windup limit
-        self._integral_limit = gains.max_output / (gains.ki if gains.ki > 0 else 1.0)
+        # Anti-windup limit (cap at reasonable value for small ki)
+        self._integral_limit = self._calculate_integral_limit(gains.ki, gains.max_output)
 
-    def update(self, error: float, dt: Optional[float] = None) -> float:
+    def _calculate_integral_limit(self, ki: float, max_output: float) -> float:
+        """Calculate integral limit, capped for small ki values."""
+        if ki >= self.MIN_KI_FOR_LIMIT:
+            return min(max_output / ki, max_output * 100)
+        return max_output * 100
+
+    def update(self, error: float, dt: Optional[float] = None, measurement: float = 0.0) -> float:
         """
         Calculate PID output for given error.
 
         Args:
             error: Current error value (normalized -1 to 1)
             dt: Time delta in seconds (calculated automatically if None)
+            measurement: Process variable for derivative-on-measurement (optional)
 
         Returns:
             Control output (clamped to max_output)
@@ -79,6 +90,9 @@ class PIDAxis:
                 dt = 0.05  # Default 20Hz
             else:
                 dt = current_time - self._prev_time
+                # Guard against negative dt from clock issues
+                if dt <= 0:
+                    dt = 0.05
         self._prev_time = current_time
 
         # Prevent division by zero
@@ -87,16 +101,28 @@ class PIDAxis:
         # Proportional term
         p_term = self.gains.kp * error
 
-        # Integral term with anti-windup
-        self._integral += error * dt
-        self._integral = max(-self._integral_limit,
-                            min(self._integral_limit, self._integral))
+        # Integral term with anti-windup (skip if error is zero to avoid windup in dead zone)
+        if error != 0.0:
+            self._integral += error * dt
+            self._integral = max(-self._integral_limit,
+                                min(self._integral_limit, self._integral))
         i_term = self.gains.ki * self._integral
 
-        # Derivative term
-        derivative = (error - self._prev_error) / dt
-        d_term = self.gains.kd * derivative
+        # Derivative term on measurement (avoids derivative kick on setpoint change)
+        # Falls back to error derivative if no measurement provided
+        if self._first_update:
+            d_term = 0.0
+            self._first_update = False
+        elif measurement != 0.0:
+            # Derivative on measurement (negative because we want to oppose change)
+            derivative = -(measurement - self._prev_measurement) / dt
+            d_term = self.gains.kd * derivative
+        else:
+            derivative = (error - self._prev_error) / dt
+            d_term = self.gains.kd * derivative
+
         self._prev_error = error
+        self._prev_measurement = measurement
 
         # Sum and clamp output
         output = p_term + i_term + d_term
@@ -108,7 +134,9 @@ class PIDAxis:
         """Reset controller state."""
         self._integral = 0.0
         self._prev_error = 0.0
+        self._prev_measurement = 0.0
         self._prev_time = None
+        self._first_update = True
 
 
 @dataclass
@@ -168,18 +196,29 @@ class PIDController:
             logger.warning(f"Unknown PID axis: {axis}")
             return
 
+        # Validate gains (prevent negative values that cause instability)
         if kp is not None:
-            pid_axis.gains.kp = kp
+            if kp < 0:
+                logger.warning(f"Ignoring negative kp={kp} for {axis}")
+            else:
+                pid_axis.gains.kp = kp
         if ki is not None:
-            pid_axis.gains.ki = ki
-            # Update anti-windup limit when ki changes
-            pid_axis._integral_limit = pid_axis.gains.max_output / (ki if ki > 0 else 1.0)
+            if ki < 0:
+                logger.warning(f"Ignoring negative ki={ki} for {axis}")
+            else:
+                pid_axis.gains.ki = ki
+                pid_axis._integral_limit = pid_axis._calculate_integral_limit(ki, pid_axis.gains.max_output)
         if kd is not None:
-            pid_axis.gains.kd = kd
+            if kd < 0:
+                logger.warning(f"Ignoring negative kd={kd} for {axis}")
+            else:
+                pid_axis.gains.kd = kd
         if max_rate is not None:
-            pid_axis.gains.max_output = max_rate
-            # Update anti-windup limit when max_output changes
-            pid_axis._integral_limit = max_rate / (pid_axis.gains.ki if pid_axis.gains.ki > 0 else 1.0)
+            if max_rate <= 0:
+                logger.warning(f"Ignoring invalid max_rate={max_rate} for {axis}")
+            else:
+                pid_axis.gains.max_output = max_rate
+                pid_axis._integral_limit = pid_axis._calculate_integral_limit(pid_axis.gains.ki, max_rate)
 
         # Reset integral to prevent windup issues from old accumulated error
         if reset_integral:
@@ -247,6 +286,9 @@ class PIDController:
             # Target size error: desired ~0.2 of frame, adjust throttle to maintain
             size_error = 0.2 - target_size
             throttle_rate = self._throttle.update(size_error)
+        else:
+            # Reset throttle PID when no target to prevent stale state
+            self._throttle.reset()
 
         return ControlOutput(
             yaw_rate=yaw_rate,

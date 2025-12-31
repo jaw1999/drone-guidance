@@ -382,7 +382,7 @@ class UDPStreamer:
             encoders = result.stdout
 
             # Priority order: VideoToolbox (Mac) > libx264 (universal)
-            # Note: h264_v4l2m2m on Pi 5 is unreliable, use libx264 instead
+            # Note: Pi 5 does NOT have hardware H.264 encoder (v4l2m2m unavailable)
             if "h264_videotoolbox" in encoders:
                 logger.info("Using macOS VideoToolbox encoder")
                 return "h264_videotoolbox", ["-realtime", "true", "-prio_speed", "true"]

@@ -73,13 +73,15 @@ class DetectionWorker:
         self.detector = detector
         self.config = config
 
-        self._input_queue: Queue[Tuple[FrameData, Tuple[int, int]]] = Queue(maxsize=4)
-        self._output_queue: Queue[FrameData] = Queue(maxsize=4)
+        self._input_queue: Queue[Tuple[np.ndarray, float, int, Tuple[int, int]]] = Queue(maxsize=2)
+        self._output_queue: Queue[Tuple[List[Detection], float, float, int]] = Queue(maxsize=2)
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
+        # (Removed _detect_buffer - no longer needed since we pass full frames)
+
     @property
-    def output_queue(self) -> Queue[FrameData]:
+    def output_queue(self) -> Queue[Tuple[List[Detection], float, float, int]]:
         return self._output_queue
 
     def start(self) -> None:
@@ -92,18 +94,25 @@ class DetectionWorker:
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
-        logger.info("Detection worker stopped")
+            if self._thread.is_alive():
+                logger.warning("Detection worker thread did not terminate cleanly")
+            else:
+                logger.info("Detection worker stopped")
 
-    def submit(self, frame_data: FrameData, orig_size: Tuple[int, int]) -> bool:
-        """Submit frame for detection."""
+    def submit(self, frame: np.ndarray, timestamp: float, frame_id: int, orig_size: Tuple[int, int]) -> bool:
+        """Submit frame for detection. Resize happens in worker thread."""
         try:
-            self._input_queue.put_nowait((frame_data, orig_size))
+            self._input_queue.put_nowait((frame, timestamp, frame_id, orig_size))
             return True
         except Full:
             return False
 
     def _run(self) -> None:
         """Main detection loop."""
+        det_w, det_h = self.config.detection_width, self.config.detection_height
+
+        # (Buffer pre-allocation removed - we pass full frames now)
+
         while self._running:
             try:
                 item = self._input_queue.get(timeout=0.1)
@@ -111,57 +120,52 @@ class DetectionWorker:
                 continue
 
             try:
-                frame_data, orig_size = item
-                frame = frame_data.frame
+                unpack_start = time.perf_counter()
+                frame, timestamp, frame_id, orig_size = item
+
                 if frame is None or frame.size == 0:
                     logger.warning("Received empty frame, skipping detection")
                     continue
 
-                det_h, det_w = frame.shape[:2]
-                if det_h == 0 or det_w == 0:
+                orig_w, orig_h = orig_size if orig_size else (frame.shape[1], frame.shape[0])
+                if orig_h == 0 or orig_w == 0:
                     logger.warning("Frame has zero dimensions, skipping")
                     continue
 
-                orig_h, orig_w = orig_size if orig_size else (det_h, det_w)
+                unpack_ms = (time.perf_counter() - unpack_start) * 1000
 
-                # Calculate scale factors
-                scale_x = orig_w / max(1, det_w)
-                scale_y = orig_h / max(1, det_h)
-
-                # Run detection
-                start = time.perf_counter()
+                # Run detection on FULL frame (YOLO handles resize internally)
+                detect_start = time.perf_counter()
                 detections = self.detector.detect(frame)
-                frame_data.inference_time_ms = (time.perf_counter() - start) * 1000
+                detect_ms = (time.perf_counter() - detect_start) * 1000
 
-                # Scale detections back to original resolution
-                scaled_detections = []
-                for det in detections:
-                    x1, y1, x2, y2 = det.bbox
-                    sx1 = int(x1 * scale_x)
-                    sy1 = int(y1 * scale_y)
-                    sx2 = int(x2 * scale_x)
-                    sy2 = int(y2 * scale_y)
-                    cx = (sx1 + sx2) // 2
-                    cy = (sy1 + sy2) // 2
+                # Use actual model inference time (more accurate)
+                inference_ms = self.detector._inference_time * 1000
 
-                    scaled_detections.append(Detection(
-                        class_id=det.class_id,
-                        class_name=det.class_name,
-                        confidence=det.confidence,
-                        bbox=(sx1, sy1, sx2, sy2),
-                        center=(cx, cy),
-                    ))
+                # Build output (detections already in correct coordinates)
+                package_start = time.perf_counter()
+                result = (detections, timestamp, inference_ms, frame_id)
+                package_ms = (time.perf_counter() - package_start) * 1000
 
-                frame_data.detections = scaled_detections
+                total_worker_ms = (time.perf_counter() - unpack_start) * 1000
 
+                # DEBUG: Log timing breakdown for first few frames
+                if not hasattr(self, '_timing_logged'):
+                    self._timing_logged = 0
+                if self._timing_logged < 3:
+                    logger.info(f"[TIMING] Total={total_worker_ms:.0f}ms: Detect={detect_ms:.0f}ms (model={inference_ms:.0f}ms), Unpack={unpack_ms:.1f}ms, Package={package_ms:.1f}ms")
+                    self._timing_logged += 1
                 try:
-                    self._output_queue.put_nowait(frame_data)
+                    self._output_queue.put_nowait(result)
                 except Full:
                     # Drop oldest result to make room
                     try:
                         self._output_queue.get_nowait()
-                        self._output_queue.put_nowait(frame_data)
                     except Empty:
+                        pass
+                    try:
+                        self._output_queue.put_nowait(result)
+                    except Full:
                         pass
 
             except Exception as e:
@@ -174,100 +178,111 @@ class TrackingInterpolator:
     Optimized for smooth tracking:
     - Always predicts to current time for consistent motion
     - Uses smoothed positions to reduce jitter
-    - Reuses objects to minimize allocations
+    - Stores lightweight tuples instead of deep copies for performance
     """
 
     def __init__(self):
-        self._last_objects: Dict[int, TrackedObject] = {}
-        self._predicted: Dict[int, TrackedObject] = {}  # Reusable cache
-        self._smoothed_pos: Dict[int, Tuple[float, float]] = {}  # Smoothed centers
+        # Store essential data as tuples: (center, bbox, velocity, class_name, confidence, frames_visible, frames_missing, last_update)
+        self._object_data: Dict[int, Tuple] = {}
+        self._smoothed_pos: Dict[int, Tuple[float, float]] = {}
         self._last_update_time: float = 0.0
+        self._lock = threading.Lock()
 
     def update_from_detection(
         self,
         objects: Dict[int, TrackedObject],
         timestamp: float,
     ) -> None:
-        """Update with fresh detection results."""
-        # Smooth position updates to reduce snap-to behavior
-        alpha = 0.6  # Higher = more responsive, lower = smoother
-        for obj_id, obj in objects.items():
-            if obj_id in self._smoothed_pos:
-                old_x, old_y = self._smoothed_pos[obj_id]
-                new_x = alpha * obj.center[0] + (1 - alpha) * old_x
-                new_y = alpha * obj.center[1] + (1 - alpha) * old_y
-                self._smoothed_pos[obj_id] = (new_x, new_y)
-            else:
-                self._smoothed_pos[obj_id] = (float(obj.center[0]), float(obj.center[1]))
+        """Update with fresh detection results (thread-safe)."""
+        with self._lock:
+            # Smooth position updates to reduce snap-to behavior
+            alpha = 0.6  # Higher = more responsive, lower = smoother
+            new_data: Dict[int, Tuple] = {}
 
-        # Remove stale smoothed positions
-        stale_smooth = [k for k in self._smoothed_pos if k not in objects]
-        for k in stale_smooth:
-            del self._smoothed_pos[k]
+            for obj_id, obj in objects.items():
+                if obj_id in self._smoothed_pos:
+                    old_x, old_y = self._smoothed_pos[obj_id]
+                    new_x = alpha * obj.center[0] + (1 - alpha) * old_x
+                    new_y = alpha * obj.center[1] + (1 - alpha) * old_y
+                    self._smoothed_pos[obj_id] = (new_x, new_y)
+                else:
+                    self._smoothed_pos[obj_id] = (float(obj.center[0]), float(obj.center[1]))
 
-        self._last_objects = objects
-        self._last_update_time = timestamp
+                # Store as lightweight tuple instead of deep copy
+                new_data[obj_id] = (
+                    obj.center,
+                    obj.bbox,
+                    obj.velocity,
+                    obj.class_name,
+                    obj.confidence,
+                    obj.frames_visible,
+                    obj.frames_missing,
+                    obj.last_update,
+                )
+
+            # Remove stale smoothed positions
+            stale_smooth = [k for k in self._smoothed_pos if k not in objects]
+            for k in stale_smooth:
+                del self._smoothed_pos[k]
+
+            self._object_data = new_data
+            self._last_update_time = timestamp
 
     def interpolate(
         self,
         timestamp: float,
     ) -> Dict[int, TrackedObject]:
-        """Predict current positions based on velocity.
+        """Predict current positions based on velocity (thread-safe).
 
-        Always returns interpolated positions for smooth motion.
+        Returns new TrackedObject instances to prevent race conditions.
         """
-        if not self._last_objects:
-            return {}
+        with self._lock:
+            if not self._object_data:
+                return {}
 
-        dt = timestamp - self._last_update_time
-        # Clamp dt to reasonable range
-        dt = max(0.0, min(dt, 0.5))
+            dt = timestamp - self._last_update_time
+            # Clamp dt to reasonable range
+            dt = max(0.0, min(dt, 0.5))
 
-        for obj_id, obj in self._last_objects.items():
-            # Start from smoothed position for stability
-            if obj_id in self._smoothed_pos:
-                base_x, base_y = self._smoothed_pos[obj_id]
-            else:
-                base_x, base_y = float(obj.center[0]), float(obj.center[1])
+            result: Dict[int, TrackedObject] = {}
 
-            # Predict new center
-            vx, vy = obj.velocity
-            new_cx = int(base_x + vx * dt)
-            new_cy = int(base_y + vy * dt)
+            for obj_id, data in self._object_data.items():
+                # Unpack tuple: (center, bbox, velocity, class_name, confidence, frames_visible, frames_missing, last_update)
+                center, bbox, velocity, class_name, confidence, frames_visible, frames_missing, last_update = data
 
-            # Predict new bbox
-            w = obj.bbox[2] - obj.bbox[0]
-            h = obj.bbox[3] - obj.bbox[1]
-            half_w = w >> 1
-            half_h = h >> 1
-            new_x1 = new_cx - half_w
-            new_y1 = new_cy - half_h
+                # Start from smoothed position for stability
+                if obj_id in self._smoothed_pos:
+                    base_x, base_y = self._smoothed_pos[obj_id]
+                else:
+                    base_x, base_y = float(center[0]), float(center[1])
 
-            # Reuse existing TrackedObject if possible
-            if obj_id in self._predicted:
-                pred = self._predicted[obj_id]
-                pred.center = (new_cx, new_cy)
-                pred.bbox = (new_x1, new_y1, new_x1 + w, new_y1 + h)
-                pred.confidence = obj.confidence
-            else:
-                self._predicted[obj_id] = TrackedObject(
+                # Predict new center
+                vx, vy = velocity
+                new_cx = int(base_x + vx * dt)
+                new_cy = int(base_y + vy * dt)
+
+                # Predict new bbox
+                w = bbox[2] - bbox[0]
+                h = bbox[3] - bbox[1]
+                half_w = w >> 1
+                half_h = h >> 1
+                new_x1 = new_cx - half_w
+                new_y1 = new_cy - half_h
+
+                # Create new TrackedObject for each call (no shared state)
+                result[obj_id] = TrackedObject(
                     object_id=obj_id,
-                    class_name=obj.class_name,
+                    class_name=class_name,
                     center=(new_cx, new_cy),
                     bbox=(new_x1, new_y1, new_x1 + w, new_y1 + h),
-                    confidence=obj.confidence,
-                    frames_visible=obj.frames_visible,
-                    frames_missing=obj.frames_missing,
-                    velocity=obj.velocity,
-                    last_update=obj.last_update,
+                    confidence=confidence,
+                    frames_visible=frames_visible,
+                    frames_missing=frames_missing,
+                    velocity=velocity,
+                    last_update=last_update,
                 )
 
-        # Remove stale predictions
-        stale = [k for k in self._predicted if k not in self._last_objects]
-        for k in stale:
-            del self._predicted[k]
-
-        return self._predicted
+            return result
 
 
 class Pipeline:
@@ -344,14 +359,10 @@ class Pipeline:
         should_detect = frames_since_detect >= self.config.detection_interval
 
         if should_detect:
-            # Submit for async detection - downscale now to reduce memory copy
-            det_w, det_h = self.config.detection_width, self.config.detection_height
-            detect_frame = cv2.resize(frame, (det_w, det_h))
-            if self._detection_worker.submit(FrameData(
-                frame=detect_frame,
-                timestamp=now,
-                frame_id=self._frame_count,
-            ), frame.shape[:2]):
+            # Submit full frame - resize happens in worker thread (off main thread)
+            if self._detection_worker.submit(
+                frame, now, self._frame_count, (frame.shape[1], frame.shape[0])
+            ):
                 self._last_detection_frame = self._frame_count
 
         # Always use interpolated positions for smooth motion
@@ -391,13 +402,16 @@ class Pipeline:
         except Empty:
             return
 
+        # Unpack tuple: (detections, timestamp, inference_ms, frame_id)
+        detections, timestamp, inference_ms, frame_id = result
+
         # Update tracker with new detections
-        self.tracker.update(result.detections)
-        self._last_detections = result.detections
-        self._inference_ms = result.inference_time_ms
+        self.tracker.update(detections)
+        self._last_detections = detections
+        self._inference_ms = inference_ms
 
         # Update interpolator with fresh tracking data
         self._interpolator.update_from_detection(
             self.tracker.all_targets,
-            result.timestamp,
+            timestamp,
         )

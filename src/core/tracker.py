@@ -419,12 +419,15 @@ class TargetTracker:
                 self._locked_target_id = self._lock_candidate_id
                 self._lock_candidate_id = None
                 self._state = TrackingState.LOCKED
+                self._save_target_info(candidate)
                 logger.info(f"Target {self._locked_target_id} locked")
         else:
-            # Confidence dropped, reset acquisition and return to searching
-            self._lock_frames = 0
-            self._lock_candidate_id = None
-            self._state = TrackingState.SEARCHING
+            # Confidence dropped - reduce lock frames but don't reset completely
+            # This provides hysteresis to handle fluctuating confidence
+            self._lock_frames = max(0, self._lock_frames - 2)
+            if self._lock_frames == 0:
+                self._lock_candidate_id = None
+                self._state = TrackingState.SEARCHING
 
     def _handle_locked(self, objects: Dict[int, TrackedObject]) -> None:
         """Handle LOCKED state."""

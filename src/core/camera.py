@@ -94,6 +94,9 @@ class CameraCapture:
 
         # RTSP or HTTP stream
         if url.startswith(("rtsp://", "http://", "https://")):
+            # Set FFmpeg options for low latency (UDP)
+            import os
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|framedrop;1"
             return url, cv2.CAP_FFMPEG
 
         # File path or other source

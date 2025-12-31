@@ -174,6 +174,10 @@ class MAVLinkController:
         self._emergency_stop = False
         self._tracking_enabled = False
 
+        # Connection health tracking
+        self._last_heartbeat_time: float = 0.0
+        self._heartbeat_timeout: float = 5.0  # Consider disconnected after 5s without heartbeat
+
         # Callbacks
         self._on_state_update: Optional[Callable[[VehicleState], None]] = None
         self._on_safety_triggered: Optional[Callable[[str], None]] = None
@@ -201,7 +205,7 @@ class MAVLinkController:
     def tracking_enabled(self) -> bool:
         """Check if tracking control is enabled (thread-safe)."""
         with self._state_lock:
-            return self._tracking_enabled and not self._emergency_stop
+            return self._tracking_enabled and not self._emergency_stop and self._connected
 
     def set_state_callback(self, callback: Callable[[VehicleState], None]) -> None:
         """Set callback for state updates."""
@@ -296,35 +300,38 @@ class MAVLinkController:
 
     def enable_tracking(self) -> bool:
         """Enable tracking control commands."""
-        if not self._connected:
-            logger.warning("Cannot enable tracking: not connected")
-            return False
+        with self._state_lock:
+            if not self._connected:
+                logger.warning("Cannot enable tracking: not connected")
+                return False
 
-        if not self.mav_config.enable_control:
-            logger.warning("Control disabled in configuration")
-            return False
+            if not self.mav_config.enable_control:
+                logger.warning("Control disabled in configuration")
+                return False
 
-        if self._emergency_stop:
-            logger.warning("Cannot enable tracking: emergency stop active")
-            return False
+            if self._emergency_stop:
+                logger.warning("Cannot enable tracking: emergency stop active")
+                return False
 
-        if self.safety_config.require_arm_confirmation and not self.is_armed:
-            logger.warning("Cannot enable tracking: vehicle not armed")
-            return False
+            if self.safety_config.require_arm_confirmation and not self._vehicle_state.armed:
+                logger.warning("Cannot enable tracking: vehicle not armed")
+                return False
 
-        self._tracking_enabled = True
-        logger.info("Tracking control enabled")
-        return True
+            self._tracking_enabled = True
+            logger.info("Tracking control enabled")
+            return True
 
     def disable_tracking(self) -> None:
         """Disable tracking control."""
-        self._tracking_enabled = False
+        with self._state_lock:
+            self._tracking_enabled = False
         logger.info("Tracking control disabled")
 
     def emergency_stop(self) -> None:
         """Trigger emergency stop."""
-        self._emergency_stop = True
-        self._tracking_enabled = False
+        with self._state_lock:
+            self._emergency_stop = True
+            self._tracking_enabled = False
         logger.warning("EMERGENCY STOP ACTIVATED")
 
         if self._on_safety_triggered:
@@ -335,7 +342,8 @@ class MAVLinkController:
 
     def clear_emergency_stop(self) -> None:
         """Clear emergency stop state."""
-        self._emergency_stop = False
+        with self._state_lock:
+            self._emergency_stop = False
         logger.info("Emergency stop cleared")
 
     def send_rate_commands(
@@ -470,6 +478,7 @@ class MAVLinkController:
         # Battery check
         if state.battery_percent < self.safety_config.min_battery_percent:
             logger.warning(f"Low battery: {state.battery_percent}%")
+            self.disable_tracking()  # Disable tracking on safety trigger
             if self._on_safety_triggered:
                 self._on_safety_triggered("low_battery")
             self._execute_safety_action(SafetyAction.RTL)
@@ -479,20 +488,26 @@ class MAVLinkController:
         if self.safety_config.geofence_enabled:
             if state.home_distance > self.safety_config.max_distance_m:
                 logger.warning(f"Geofence breach: distance {state.home_distance}m")
+                self.disable_tracking()
                 if self._on_safety_triggered:
                     self._on_safety_triggered("geofence_distance")
+                self._execute_safety_action(SafetyAction.RTL)
                 return False
 
             if state.altitude_rel > self.safety_config.max_altitude_m:
                 logger.warning(f"Max altitude breach: {state.altitude_rel}m")
+                self.disable_tracking()
                 if self._on_safety_triggered:
                     self._on_safety_triggered("geofence_altitude_max")
+                self._execute_safety_action(SafetyAction.LOITER)
                 return False
 
             if state.altitude_rel < self.safety_config.min_altitude_m:
                 logger.warning(f"Min altitude breach: {state.altitude_rel}m")
+                self.disable_tracking()
                 if self._on_safety_triggered:
                     self._on_safety_triggered("geofence_altitude_min")
+                self._execute_safety_action(SafetyAction.LOITER)
                 return False
 
         return True
@@ -528,6 +543,18 @@ class MAVLinkController:
                 if msg:
                     self._process_message(msg)
 
+                # Check for connection timeout (no heartbeat received)
+                if self._last_heartbeat_time > 0:
+                    time_since_heartbeat = time.time() - self._last_heartbeat_time
+                    if time_since_heartbeat > self._heartbeat_timeout:
+                        with self._state_lock:
+                            if self._connected:
+                                logger.warning(f"Connection lost: no heartbeat for {time_since_heartbeat:.1f}s")
+                                self._connected = False
+                                self._tracking_enabled = False
+                        if self._on_safety_triggered:
+                            self._on_safety_triggered("connection_lost")
+
             except Exception as e:
                 logger.error(f"Receive error: {e}")
                 time.sleep(0.1)
@@ -542,7 +569,12 @@ class MAVLinkController:
                 self._vehicle_state.armed = (
                     msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
                 ) != 0
-                # Decode mode from custom_mode
+                # Update heartbeat time for connection monitoring
+                self._last_heartbeat_time = time.time()
+                # Restore connection if it was lost
+                if not self._connected:
+                    logger.info("Connection restored")
+                    self._connected = True
 
             elif msg_type == "GLOBAL_POSITION_INT":
                 self._vehicle_state.latitude = msg.lat / 1e7
@@ -550,6 +582,15 @@ class MAVLinkController:
                 self._vehicle_state.altitude_msl = msg.alt / 1000.0
                 self._vehicle_state.altitude_rel = msg.relative_alt / 1000.0
                 self._vehicle_state.heading = msg.hdg / 100.0
+
+                # Update distance from home on every position update (not just HOME_POSITION)
+                if self._vehicle_state.home_latitude != 0 and self._vehicle_state.latitude != 0:
+                    self._vehicle_state.home_distance = haversine_distance(
+                        self._vehicle_state.latitude,
+                        self._vehicle_state.longitude,
+                        self._vehicle_state.home_latitude,
+                        self._vehicle_state.home_longitude,
+                    )
 
             elif msg_type == "VFR_HUD":
                 self._vehicle_state.groundspeed = msg.groundspeed
@@ -566,7 +607,7 @@ class MAVLinkController:
                 self._vehicle_state.satellites = msg.satellites_visible
 
             elif msg_type == "HOME_POSITION":
-                # Store home position and calculate distance
+                # Store home position
                 self._vehicle_state.home_latitude = msg.latitude / 1e7
                 self._vehicle_state.home_longitude = msg.longitude / 1e7
                 self._vehicle_state.home_altitude = msg.altitude / 1000.0

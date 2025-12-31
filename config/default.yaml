@@ -8,10 +8,9 @@ camera:
   # - Webcam index: "0" (or "1", "2", etc.)
   # - Video file: "/path/to/video.mp4"
   # - HTTP MJPEG: "http://192.168.1.129:8554/stream"
-  rtsp_url: "rtsp://192.168.1.129:8554/stream"
+  rtsp_url: "rtsp://root:12345@192.168.2.10/stream=0"
 
   # Camera specifications (used for FOV calculations)
-  # Lower resolution for webcam testing, increase for RTSP
   resolution:
     width: 1280
     height: 720
@@ -45,11 +44,12 @@ detector:
   model: "yolo11n"
 
   # Path to custom model weights (optional, uses default if empty)
-  weights_path: ""
+  # Using direct .pt model for stability
+  weights_path: "yolo11n_ncnn_model"
 
   # Auto-export to NCNN format on first run (~4x faster on ARM)
-  # Set to false if you want to manage model format manually
-  auto_export_ncnn: true
+  # Disabled - causes instability
+  auto_export_ncnn: false
 
   # Inference settings
   confidence_threshold: 0.5
@@ -64,9 +64,10 @@ detector:
     - "boat"
 
   # Model input resolution - CRITICAL for distance detection
-  # 640 = best for distance (required for small/far targets)
-  # 480 = balanced (moderate distance)
-  # 320 = close-range only (fastest, but misses distant targets)
+  # 640 = best for distance (~320ms on Pi 5, too slow)
+  # 480 = balanced (~200ms, recommended for good range + speed)
+  # 416 = fast (~130ms, good for moderate range) ← CURRENT
+  # 320 = close-range only (~90ms, fastest)
   input_size: 640
 
   # FP16 - not supported on Pi CPU, keep false
@@ -75,7 +76,7 @@ detector:
   # Performance: run detection every N frames (1 = every frame)
   # Higher values reduce CPU load, tracker interpolates between
   # Recommended: 3-5 for 30fps input (gives 6-10 detections/sec)
-  detection_interval: 3
+  detection_interval: 10
 
   # Detection resolution (downscale camera frame before detection)
   # This is independent of input_size - frame is resized to this first,
