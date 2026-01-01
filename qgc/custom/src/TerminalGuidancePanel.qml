@@ -2,6 +2,9 @@
  *
  * Terminal Guidance - Tracking Control Panel for QGroundControl
  *
+ * Minimal flight operations panel. All configuration is done via the
+ * web UI on the companion computer (http://<pi-ip>:5000).
+ *
  ****************************************************************************/
 
 import QtQuick
@@ -22,25 +25,23 @@ Rectangle {
     border.color: qgcPal.windowShade
     border.width: 1
 
-    // Connection config
-    property string serverHost: "192.168.1.147"
+    // Connection to companion computer - editable in UI
+    property string serverHost: "192.168.2.11"
     property int serverPort: 5000
     property string serverUrl: "http://" + serverHost + ":" + serverPort
-    property bool autoConnect: true
+    property bool autoConnect: false
 
     property real _margins: ScreenTools.defaultFontPixelWidth
-    property real _panelWidth: ScreenTools.defaultFontPixelWidth * 24
+    property real _panelWidth: ScreenTools.defaultFontPixelWidth * 22
 
-    // State
+    // Tracking state from API
     property bool connected: false
     property bool connecting: false
     property string lastError: ""
     property string trackingState: "searching"
     property bool controlEnabled: false
     property int lockedTargetId: -1
-    property var targets: []
-    property real fps: 0
-    property real inferenceMs: 0
+    property int targetCount: 0
     property bool showConfig: !connected
 
     QGCPalette { id: qgcPal }
@@ -68,9 +69,7 @@ Rectangle {
                         trackingState = r.tracking_state || "searching"
                         controlEnabled = r.control_enabled || false
                         lockedTargetId = r.locked_target_id !== null ? r.locked_target_id : -1
-                        targets = r.targets || []
-                        fps = r.fps || 0
-                        inferenceMs = r.inference_ms || 0
+                        targetCount = r.targets ? r.targets.length : 0
                     } catch (e) {
                         setError("Parse error")
                     }
@@ -88,7 +87,7 @@ Rectangle {
             xhr.send()
         } catch (e) {
             connecting = false
-            setError("Failed")
+            setError("Request failed")
         }
     }
 
@@ -100,8 +99,10 @@ Rectangle {
     function sendCommand(endpoint, body) {
         var xhr = new XMLHttpRequest()
         xhr.onreadystatechange = function() {
-            if (xhr.readyState === XMLHttpRequest.DONE && xhr.status === 200) {
-                fetchStatus()
+            if (xhr.readyState === XMLHttpRequest.DONE) {
+                if (xhr.status === 200) {
+                    fetchStatus()
+                }
             }
         }
         xhr.open("POST", serverUrl + endpoint)
@@ -127,22 +128,22 @@ Rectangle {
     ColumnLayout {
         id: panelColumn
         anchors.centerIn: parent
-        spacing: _margins * 0.75
+        spacing: _margins * 0.5
         width: _panelWidth
 
-        // Header
+        // Header with connection indicator
         RowLayout {
             Layout.fillWidth: true
             spacing: _margins * 0.5
 
             QGCLabel {
-                text: "Terminal Guidance"
+                text: "Tracking"
                 font.pointSize: ScreenTools.mediumFontPointSize
                 font.bold: true
                 Layout.fillWidth: true
             }
 
-            // Connection indicator (clickable)
+            // Connection indicator (tap to show/hide config)
             Rectangle {
                 width: ScreenTools.defaultFontPixelWidth * 1.2
                 height: width
@@ -164,7 +165,7 @@ Rectangle {
             }
         }
 
-        // Connection config (shown when disconnected or toggled)
+        // Connection config panel (collapsible)
         Rectangle {
             Layout.fillWidth: true
             height: showConfig ? configCol.height + _margins : 0
@@ -181,9 +182,9 @@ Rectangle {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 anchors.margins: _margins * 0.5
-                spacing: _margins * 0.5
+                spacing: _margins * 0.4
 
-                // Server input - single line
+                // IP:Port input row
                 RowLayout {
                     Layout.fillWidth: true
                     spacing: 4
@@ -192,7 +193,7 @@ Rectangle {
                         id: hostInput
                         Layout.fillWidth: true
                         text: serverHost
-                        placeholderText: "IP Address"
+                        placeholderText: "Pi IP"
                         font.pointSize: ScreenTools.smallFontPointSize
                         onTextChanged: serverHost = text
                     }
@@ -204,7 +205,7 @@ Rectangle {
 
                     QGCTextField {
                         id: portInput
-                        Layout.preferredWidth: ScreenTools.defaultFontPixelWidth * 6
+                        Layout.preferredWidth: ScreenTools.defaultFontPixelWidth * 5
                         text: serverPort.toString()
                         font.pointSize: ScreenTools.smallFontPointSize
                         validator: IntValidator { bottom: 1; top: 65535 }
@@ -215,80 +216,64 @@ Rectangle {
                     }
                 }
 
-                // Connect/Disconnect
-                RowLayout {
+                // Connect button
+                QGCButton {
                     Layout.fillWidth: true
-                    spacing: _margins * 0.5
-
-                    QGCButton {
-                        text: connected ? "Reconnect" : "Connect"
-                        Layout.fillWidth: true
-                        enabled: !connecting
-                        onClicked: doConnect()
-                    }
-
-                    QGCButton {
-                        text: "Disconnect"
-                        Layout.fillWidth: true
-                        enabled: connected || connecting
-                        onClicked: doDisconnect()
-                    }
+                    text: connecting ? "Connecting..." : (connected ? "Reconnect" : "Connect")
+                    enabled: !connecting
+                    onClicked: doConnect()
                 }
 
-                // Status line
+                // Error display
                 QGCLabel {
+                    visible: lastError !== ""
                     Layout.fillWidth: true
+                    text: lastError
                     font.pointSize: ScreenTools.smallFontPointSize
-                    color: connected ? qgcPal.colorGreen : (lastError ? qgcPal.colorOrange : qgcPal.text)
-                    text: {
-                        if (connecting) return "Connecting..."
-                        if (connected) return "Connected - " + fps.toFixed(0) + " FPS"
-                        if (lastError) return lastError
-                        return "Not connected"
-                    }
+                    color: qgcPal.colorOrange
+                    horizontalAlignment: Text.AlignHCenter
                 }
             }
         }
 
-        // Separator
-        Rectangle {
-            Layout.fillWidth: true
-            height: 1
-            color: qgcPal.windowShade
-        }
-
-        // Main content - only when connected
+        // Main controls - only when connected
         ColumnLayout {
             Layout.fillWidth: true
             spacing: _margins * 0.5
             visible: connected
 
-            // Status grid
-            GridLayout {
-                columns: 2
-                columnSpacing: _margins
-                rowSpacing: 2
+            // Status display - compact
+            Rectangle {
                 Layout.fillWidth: true
+                height: statusRow.height + _margins * 0.6
+                color: trackingState === "locked" ? Qt.rgba(0, 0.5, 0, 0.2) :
+                       trackingState === "lost" ? Qt.rgba(0.5, 0, 0, 0.2) :
+                       Qt.rgba(0.5, 0.5, 0, 0.1)
+                radius: 4
 
-                QGCLabel { text: "State:"; font.pointSize: ScreenTools.smallFontPointSize }
-                QGCLabel {
-                    text: trackingState.charAt(0).toUpperCase() + trackingState.slice(1)
-                    font.bold: true
-                    font.pointSize: ScreenTools.smallFontPointSize
-                    color: trackingState === "locked" ? qgcPal.colorGreen :
-                           trackingState === "acquiring" ? qgcPal.colorOrange :
-                           trackingState === "lost" ? qgcPal.colorRed : qgcPal.text
-                }
+                RowLayout {
+                    id: statusRow
+                    anchors.centerIn: parent
+                    spacing: _margins
 
-                QGCLabel { text: "Target:"; font.pointSize: ScreenTools.smallFontPointSize }
-                QGCLabel {
-                    text: lockedTargetId >= 0 ? "Locked #" + lockedTargetId : (targets.length + " detected")
-                    font.pointSize: ScreenTools.smallFontPointSize
-                    color: lockedTargetId >= 0 ? qgcPal.colorGreen : qgcPal.text
+                    QGCLabel {
+                        text: trackingState.charAt(0).toUpperCase() + trackingState.slice(1)
+                        font.bold: true
+                        font.pointSize: ScreenTools.defaultFontPointSize
+                        color: trackingState === "locked" ? qgcPal.colorGreen :
+                               trackingState === "lost" ? qgcPal.colorRed :
+                               trackingState === "acquiring" ? qgcPal.colorOrange : qgcPal.text
+                    }
+
+                    QGCLabel {
+                        text: lockedTargetId >= 0 ? "#" + lockedTargetId : "(" + targetCount + ")"
+                        font.pointSize: ScreenTools.smallFontPointSize
+                        color: qgcPal.text
+                    }
                 }
             }
 
-            // Lock controls
+            // Lock / Unlock
             RowLayout {
                 Layout.fillWidth: true
                 spacing: _margins * 0.5
@@ -296,7 +281,7 @@ Rectangle {
                 QGCButton {
                     text: "Lock"
                     Layout.fillWidth: true
-                    enabled: lockedTargetId < 0 && targets.length > 0
+                    enabled: lockedTargetId < 0 && targetCount > 0
                     onClicked: sendCommand("/api/tracking/lock", null)
                 }
 
@@ -308,28 +293,7 @@ Rectangle {
                 }
             }
 
-            // Target buttons (max 3)
-            Repeater {
-                model: targets.length > 0 && targets.length <= 3 ? targets : []
-
-                QGCButton {
-                    Layout.fillWidth: true
-                    text: modelData["class"] + " (" + (modelData.confidence * 100).toFixed(0) + "%)"
-                    enabled: lockedTargetId !== modelData.id
-                    highlighted: lockedTargetId === modelData.id
-                    font.pointSize: ScreenTools.smallFontPointSize
-                    onClicked: sendCommand("/api/tracking/lock", {"target_id": modelData.id})
-                }
-            }
-
-            // Separator
-            Rectangle {
-                Layout.fillWidth: true
-                height: 1
-                color: qgcPal.windowShade
-            }
-
-            // Control buttons
+            // Enable / Disable control
             RowLayout {
                 Layout.fillWidth: true
                 spacing: _margins * 0.5
@@ -342,9 +306,9 @@ Rectangle {
 
                     background: Rectangle {
                         color: controlEnabled ? qgcPal.colorGreen :
-                               (enableBtn.enabled ? (enableBtn.pressed ? Qt.darker(qgcPal.colorGreen, 1.2) : qgcPal.colorGreen) : qgcPal.windowShade)
+                               (enableBtn.enabled ? qgcPal.colorGreen : qgcPal.windowShade)
                         radius: 4
-                        opacity: enableBtn.enabled || controlEnabled ? 1.0 : 0.5
+                        opacity: enableBtn.enabled || controlEnabled ? 1.0 : 0.4
                     }
                     contentItem: Text {
                         text: enableBtn.text
@@ -366,17 +330,17 @@ Rectangle {
                 }
             }
 
-            // Emergency Stop
+            // Emergency Stop - always visible and enabled when connected
             QGCButton {
                 Layout.fillWidth: true
-                text: "EMERGENCY STOP"
+                text: "STOP"
 
                 background: Rectangle {
                     color: parent.pressed ? Qt.darker("#cc0000", 1.2) : "#cc0000"
                     radius: 4
                 }
                 contentItem: Text {
-                    text: "EMERGENCY STOP"
+                    text: "STOP"
                     color: "white"
                     font.bold: true
                     font.pointSize: ScreenTools.defaultFontPointSize
@@ -388,11 +352,11 @@ Rectangle {
             }
         }
 
-        // Disconnected state
+        // Disconnected hint
         QGCLabel {
             visible: !connected && !showConfig
             Layout.fillWidth: true
-            text: "Tap indicator to configure"
+            text: "Tap dot to connect"
             font.pointSize: ScreenTools.smallFontPointSize
             color: qgcPal.colorGrey
             horizontalAlignment: Text.AlignHCenter

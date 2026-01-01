@@ -327,6 +327,8 @@ class TerminalGuidance:
             "battery": vehicle.battery_percent if vehicle else 0,
             "armed": vehicle.armed if vehicle else False,
             "connected": self._mavlink.is_connected if self._mavlink else False,
+            "camera_connected": self._camera.is_connected if self._camera else False,
+            "mavlink_connected": self._mavlink.is_connected if self._mavlink else False,
         }
 
     def get_preview_frame(self) -> Optional[np.ndarray]:
