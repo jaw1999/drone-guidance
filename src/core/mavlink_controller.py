@@ -45,6 +45,13 @@ class SafetyAction(Enum):
     LAND = "land"
 
 
+class VehicleType(Enum):
+    """Vehicle type for control mode selection."""
+    COPTER = "copter"
+    PLANE = "plane"
+    AUTO = "auto"  # Auto-detect from heartbeat
+
+
 class TrackingCommand(Enum):
     """Custom MAVLink commands for tracking control.
 
@@ -67,11 +74,24 @@ class MAVLinkConfig:
     heartbeat_rate: float = 1.0
     command_timeout: float = 5.0
     enable_control: bool = False
+    vehicle_type: VehicleType = VehicleType.PLANE
+    # Intercept settings
+    cruise_throttle: int = 50      # Cruise throttle %
+    tracking_throttle: int = 70    # Throttle when tracking %
+    max_turn_rate: float = 45.0
+    max_climb_rate: float = 5.0
 
     @classmethod
     def from_dict(cls, config: dict) -> "MAVLinkConfig":
         """Create config from dictionary."""
         mav = config.get("mavlink", {})
+        intercept = mav.get("intercept", {})
+        vehicle_str = mav.get("vehicle_type", "plane")
+        try:
+            vehicle_type = VehicleType(vehicle_str)
+        except ValueError:
+            vehicle_type = VehicleType.PLANE
+
         return cls(
             connection=mav.get("connection", "udp:192.168.1.1:14550"),
             source_system=mav.get("source_system", 255),
@@ -79,6 +99,11 @@ class MAVLinkConfig:
             heartbeat_rate=mav.get("heartbeat_rate", 1.0),
             command_timeout=mav.get("command_timeout", 5.0),
             enable_control=mav.get("enable_control", False),
+            vehicle_type=vehicle_type,
+            cruise_throttle=intercept.get("cruise_throttle", 50),
+            tracking_throttle=intercept.get("tracking_throttle", 70),
+            max_turn_rate=intercept.get("max_turn_rate", 45.0),
+            max_climb_rate=intercept.get("max_climb_rate", 5.0),
         )
 
 
@@ -143,6 +168,10 @@ class VehicleState:
     gps_fix: int = 0
     satellites: int = 0
     last_update: float = 0.0
+    # Vehicle type (detected from heartbeat)
+    vehicle_type: str = "unknown"  # "plane", "copter", "rover", etc.
+    # Throttle for fixed-wing
+    throttle_percent: float = 0.0
 
 
 class MAVLinkController:
@@ -177,6 +206,14 @@ class MAVLinkController:
         # Connection health tracking
         self._last_heartbeat_time: float = 0.0
         self._heartbeat_timeout: float = 5.0  # Consider disconnected after 5s without heartbeat
+
+        # Vehicle type (can be configured or auto-detected)
+        self._vehicle_type = mav_config.vehicle_type
+        self._detected_vehicle_type: Optional[VehicleType] = None
+
+        # Fixed-wing tracking state
+        self._base_throttle: float = 50.0  # Cruise throttle %
+        self._tracking_throttle_boost: float = 10.0  # Extra throttle when tracking
 
         # Callbacks
         self._on_state_update: Optional[Callable[[VehicleState], None]] = None
@@ -318,13 +355,24 @@ class MAVLinkController:
                 return False
 
             self._tracking_enabled = True
-            logger.info("Tracking control enabled")
-            return True
+
+        # Set GUIDED mode and boost throttle for intercept
+        self._set_mode("GUIDED")
+        self.set_throttle_boost(True)
+        logger.info("Tracking control enabled - GUIDED mode, throttle boosted")
+        return True
 
     def disable_tracking(self) -> None:
         """Disable tracking control."""
         with self._state_lock:
+            was_enabled = self._tracking_enabled
             self._tracking_enabled = False
+
+        if was_enabled:
+            # Reduce throttle back to cruise
+            self.set_throttle_boost(False)
+            # Switch to LOITER to hold position
+            self._set_mode("LOITER")
         logger.info("Tracking control disabled")
 
     def emergency_stop(self) -> None:
@@ -353,52 +401,62 @@ class MAVLinkController:
         throttle_rate: float,
     ) -> bool:
         """
-        Send rate-based control commands.
+        Send control commands for fixed-wing intercept.
 
-        Args:
-            yaw_rate: Yaw rate in deg/sec (positive = clockwise)
-            pitch_rate: Pitch rate in deg/sec (positive = nose up)
-            throttle_rate: Vertical rate in m/sec (positive = up)
+        For fixed-wing with fixed camera:
+        - yaw_rate: Turn rate to keep target horizontally centered (deg/sec)
+        - pitch_rate: Climb/dive rate to keep target vertically centered (converted to altitude change)
+        - throttle_rate: Ignored for now (we boost throttle when tracking is enabled)
 
-        Returns:
-            True if command sent successfully
+        Uses DO_CHANGE_SPEED for throttle and SET_ATTITUDE_TARGET for heading/pitch.
         """
         if not self.tracking_enabled:
             return False
 
-        # Check safety limits
         if not self._check_safety():
             return False
 
-        # Clamp rates
-        max_speed = self.safety_config.max_tracking_speed
-        yaw_rate = max(-90, min(90, yaw_rate))
-        pitch_rate = max(-45, min(45, pitch_rate))
-        throttle_rate = max(-max_speed, min(max_speed, throttle_rate))
+        # Clamp rates to config limits
+        max_turn = self.mav_config.max_turn_rate
+        yaw_rate = max(-max_turn, min(max_turn, yaw_rate))
+        pitch_rate = max(-20, min(20, pitch_rate))  # Pitch rate for climb/dive
 
         try:
-            # Send SET_ATTITUDE_TARGET or velocity commands
-            # Using velocity control for ArduPilot
             from pymavlink import mavutil
 
-            # Convert pitch rate to forward velocity (simplified)
-            # Positive pitch = nose up = forward motion in tracking context
-            vx = pitch_rate * 0.5  # Scale factor
-            vy = 0  # No lateral movement for now
-            vz = -throttle_rate  # NED frame: negative Z is up
+            # Get current heading and adjust
+            current_heading = self._vehicle_state.heading
+            # yaw_rate is deg/sec, we send at ~20Hz, so delta per command
+            heading_delta = yaw_rate * 0.05  # 50ms update rate
+            new_heading = (current_heading + heading_delta) % 360
 
-            # Send velocity command in body frame
-            self._connection.mav.set_position_target_local_ned_send(
+            # Get current altitude and adjust
+            current_alt = self._vehicle_state.altitude_rel
+            # pitch_rate converts to climb rate: positive pitch = nose down = descend toward target
+            # For intercept: target below center = pitch down = descend
+            alt_delta = -pitch_rate * 0.1  # Scale to meters per update
+            new_alt = current_alt + alt_delta
+
+            # Clamp altitude to safety limits
+            new_alt = max(self.safety_config.min_altitude_m,
+                         min(self.safety_config.max_altitude_m, new_alt))
+
+            # Send GUIDED mode target: heading + altitude
+            # Using SET_POSITION_TARGET_GLOBAL_INT with heading
+            self._connection.mav.set_position_target_global_int_send(
                 0,  # time_boot_ms
                 self._connection.target_system,
                 self._connection.target_component,
-                mavutil.mavlink.MAV_FRAME_BODY_NED,
-                0b0000011111000111,  # Velocity only
-                0, 0, 0,  # Position (ignored)
-                vx, vy, vz,  # Velocity
-                0, 0, 0,  # Acceleration (ignored)
-                0,  # Yaw (ignored)
-                yaw_rate * 0.0174533,  # Yaw rate in rad/s
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                # type_mask: ignore position (lat/lon), use altitude and heading
+                0b0000111111111000,  # Only altitude and yaw
+                0,  # lat (ignored)
+                0,  # lon (ignored)
+                new_alt,  # altitude
+                0, 0, 0,  # velocity (ignored)
+                0, 0, 0,  # acceleration (ignored)
+                math.radians(new_heading),  # yaw in radians
+                0,  # yaw_rate (ignored)
             )
 
             return True
@@ -406,6 +464,45 @@ class MAVLinkController:
         except Exception as e:
             logger.error(f"Failed to send command: {e}")
             return False
+
+    def set_throttle(self, throttle_percent: int) -> bool:
+        """
+        Set throttle via DO_CHANGE_SPEED command.
+
+        Args:
+            throttle_percent: Throttle 0-100%
+        """
+        if not self._connected or not self._connection:
+            return False
+
+        try:
+            from pymavlink import mavutil
+
+            throttle_percent = max(0, min(100, throttle_percent))
+
+            # DO_CHANGE_SPEED: speed_type, speed (-1 = no change), throttle %
+            self._connection.mav.command_long_send(
+                self._connection.target_system,
+                self._connection.target_component,
+                mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+                0,  # confirmation
+                0,  # speed type (ignored when using throttle)
+                -1,  # speed (no change)
+                throttle_percent,  # throttle %
+                0, 0, 0, 0  # unused
+            )
+
+            logger.info(f"Throttle set to {throttle_percent}%")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to set throttle: {e}")
+            return False
+
+    def set_throttle_boost(self, enabled: bool) -> bool:
+        """Enable/disable throttle boost for intercept."""
+        throttle = self.mav_config.tracking_throttle if enabled else self.mav_config.cruise_throttle
+        return self.set_throttle(throttle)
 
     def execute_lost_target_action(self) -> None:
         """Execute configured action when target is lost."""

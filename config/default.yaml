@@ -134,36 +134,37 @@ tracker:
   #   head: "models/nanotrack_head.onnx"
 
 # PID Controller Configuration
+# Tuned for fixed-wing intercept - gentle corrections to keep target in frame
 pid:
-  # Yaw control (horizontal centering)
+  # Yaw control (horizontal centering) - gentle turns
   yaw:
-    kp: 0.5
-    ki: 0.01
-    kd: 0.1
-    max_rate: 30.0  # Max yaw rate in deg/sec
-    derivative_filter: 0.1  # Low-pass filter (0=heavy filtering, 1=none)
-    slew_rate: 60.0  # Max rate change per second (deg/sec^2)
+    kp: 0.3           # Reduced for smoother turns
+    ki: 0.005         # Low integral to prevent overshoot
+    kd: 0.15          # Higher derivative to dampen oscillations
+    max_rate: 15.0    # Max 15 deg/sec turn rate (gentle)
+    derivative_filter: 0.2
+    slew_rate: 20.0   # Slow ramp-up to prevent jerky turns
 
-  # Pitch control (vertical centering)
+  # Pitch control (vertical centering / altitude)
   pitch:
-    kp: 0.4
-    ki: 0.01
-    kd: 0.08
-    max_rate: 20.0  # Max pitch rate in deg/sec
-    derivative_filter: 0.1
-    slew_rate: 40.0
-
-  # Throttle control (distance/altitude)
-  throttle:
-    kp: 0.3
+    kp: 0.25          # Gentle climb/dive
     ki: 0.005
-    kd: 0.05
-    max_rate: 2.0  # Max climb rate in m/sec
-    derivative_filter: 0.2  # Less filtering for altitude (more responsive)
-    slew_rate: 4.0
+    kd: 0.12
+    max_rate: 10.0    # Max 10 deg/sec pitch change
+    derivative_filter: 0.2
+    slew_rate: 15.0
 
-  # Dead zone - no correction if target within this % of center
-  dead_zone_percent: 5.0
+  # Throttle control (not used for fixed-wing - throttle is set directly)
+  throttle:
+    kp: 0.0
+    ki: 0.0
+    kd: 0.0
+    max_rate: 0.0
+    derivative_filter: 0.0
+    slew_rate: 0.0
+
+  # Dead zone - larger zone so small errors don't cause corrections
+  dead_zone_percent: 10.0
 
   # Control update rate (Hz)
   update_rate: 20
@@ -185,6 +186,16 @@ mavlink:
 
   # Enable actual control commands (set false for testing)
   enable_control: false
+
+  # Vehicle type: "plane" (fixed-wing), "copter", or "auto" (detect from heartbeat)
+  vehicle_type: "plane"
+
+  # Fixed-wing intercept settings
+  intercept:
+    cruise_throttle: 50   # Normal cruise throttle %
+    tracking_throttle: 70 # Throttle when tracking %
+    max_turn_rate: 45.0   # Max heading change rate (deg/sec)
+    max_climb_rate: 5.0   # Max climb/dive rate (m/s)
 
 # Safety Configuration
 safety:
