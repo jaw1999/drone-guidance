@@ -203,21 +203,3 @@ python -m src.app --log-level DEBUG
 python -m src.app --no-web
 ```
 
-### Testing on macOS
-
-- Uses `h264_videotoolbox` or `libx264` encoder
-- Set `half_precision: false`
-- Use webcam index "0" as camera source
-
-## Dependencies
-
-- ultralytics - YOLO11 inference
-- opencv-python-headless - Video capture and processing
-- pymavlink - MAVLink communication
-- flask - Web UI
-- numpy, scipy - Numerical operations
-- psutil - System health monitoring
-
-## License
-
-MIT
