@@ -123,12 +123,36 @@ Access at `http://<pi-ip>:5000`:
 ## Architecture
 
 ```
-Camera -> Detection (YOLO11n) -> Tracking -> PID Controller -> MAVLink
-               |
-         Overlay Renderer -> FFmpeg -> UDP -> QGC
-               |
-            Web UI
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Raspberry Pi 5                              │
+│                                                                     │
+│  Camera -> Detection (YOLO11n) -> Tracking -> PID Controller        │
+│                 |                                  |                │
+│           Overlay Renderer                    MAVLink UDP           │
+│                 |                                  |                │
+│              FFmpeg                                v                │
+│                 |                         Flight Controller         │
+│                 v                                                   │
+│            UDP :5600 ─────────────────────────────────────┐         │
+│                                                           │         │
+│         Flask API :5000 <─────────────────────────────┐   │         │
+└───────────────────────────────────────────────────────│───│─────────┘
+                                                        │   │
+┌───────────────────────────────────────────────────────│───│─────────┐
+│                      Ground Station                   │   │         │
+│                                                       v   v         │
+│  QGroundControl ─── HTTP API calls ──────────────> Pi:5000          │
+│       │                                                             │
+│       └── Video Stream <─────────────────────────── Pi:5600         │
+│                                                                     │
+│  Custom Terminal Guidance tab makes REST API calls to Raspberry Pi  │
+└─────────────────────────────────────────────────────────────────────┘
 ```
+
+**Data Flow:**
+1. QGC custom tab sends HTTP requests to Pi's Flask API (port 5000)
+2. Pi processes commands and sends MAVLink rate commands to flight controller
+3. Pi streams H.264 video with overlay to QGC (port 5600)
 
 ### Components
 
@@ -169,17 +193,55 @@ Notes:
 - FP16 not supported on Pi 5 CPU
 - Pipeline maintains 30 FPS output with velocity interpolation
 
-## MAVLink Commands
+## HTTP API
 
-Custom commands from QGC via COMMAND_LONG:
+The QGC custom plugin controls Terminal Guidance via REST API calls to the Raspberry Pi.
 
-| Command | MAV_CMD | Description |
-|---------|---------|-------------|
-| Auto-lock | 31010 (USER_1) | Lock onto best target |
-| Lock target | 31011 (USER_2) | Lock specific target (param1 = target_id) |
-| Unlock | 31012 (USER_3) | Release current lock |
-| Enable control | 31013 (USER_4) | Enable tracking control |
-| Disable control | 31014 (USER_5) | Disable tracking control |
+### Tracking Control
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/tracking/lock` | POST | Auto-lock onto best target |
+| `/api/tracking/lock/<id>` | POST | Lock specific target by ID |
+| `/api/tracking/unlock` | POST | Release current lock |
+| `/api/tracking/enable` | POST | Enable PID control output |
+| `/api/tracking/disable` | POST | Disable PID control output |
+
+### Status & Config
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/status` | GET | System status (FPS, targets, state) |
+| `/api/config` | GET | Current configuration |
+| `/api/config` | POST | Update configuration (JSON body) |
+| `/api/emergency-stop` | POST | Activate emergency stop |
+| `/api/emergency-stop/clear` | POST | Clear emergency stop |
+
+### Service Management
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/services/status` | GET | Status of all components |
+| `/api/restart/detector` | POST | Restart detector |
+| `/api/restart/camera` | POST | Restart camera |
+| `/api/restart/streamer` | POST | Restart video streamer |
+| `/api/restart/mavlink` | POST | Restart MAVLink connection |
+| `/api/restart/all` | POST | Restart all services |
+
+### Example Usage
+
+```bash
+# Get system status
+curl http://192.168.1.100:5000/api/status
+
+# Lock onto a target
+curl -X POST http://192.168.1.100:5000/api/tracking/lock
+
+# Update detection confidence
+curl -X POST http://192.168.1.100:5000/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"detector": {"confidence_threshold": 0.6}}'
+```
 
 ## Systemd Service
 
