@@ -30,25 +30,28 @@ camera:
 
 # Detection Model Configuration
 # =============================
-# Performance on Raspberry Pi 5 (YOLO11n at 640px):
-#   - PyTorch: ~388ms/frame (~2.5 FPS)
-#   - NCNN:    ~94ms/frame  (~10 FPS) - 4x faster!
+# Performance on Raspberry Pi 5:
+#   NCNN (FP32):    ~130-160ms/frame (~6-8 FPS detection)
+#   TFLite INT8:    ~28ms/frame (~35 FPS detection) - RECOMMENDED
 #
-# With detection_interval=3 and tracker interpolation:
-#   - Effective tracking: 30 FPS (smooth)
-#   - Detection load: 10 detections/sec
+# To use TFLite INT8:
+#   1. Run: python scripts/convert_to_tflite.py --int8
+#   2. Set backend: "tflite" below
 #
 detector:
   # Model selection: yolo11n (recommended), yolo11s, yolov8n, yolov8s
   # YOLO11n is fastest on ARM, best accuracy/speed tradeoff
   model: "yolo11n"
 
+  # Backend: "ncnn" (default), "openvino", "pytorch"
+  backend: "ncnn"
+
   # Path to custom model weights (optional, uses default if empty)
-  # Using direct .pt model for stability
+  # For NCNN: "yolo11n_ncnn_model"
+  # For TFLite: "yolo11n_int8.tflite"
   weights_path: "yolo11n_ncnn_model"
 
   # Auto-export to NCNN format on first run (~4x faster on ARM)
-  # Disabled - causes instability
   auto_export_ncnn: false
 
   # Inference settings
@@ -63,11 +66,10 @@ detector:
     - "truck"
     - "boat"
 
-  # Model input resolution - CRITICAL for distance detection
-  # 640 = best for distance (~320ms on Pi 5, too slow)
-  # 480 = balanced (~200ms, recommended for good range + speed)
-  # 416 = fast (~130ms, good for moderate range) ← CURRENT
-  # 320 = close-range only (~90ms, fastest)
+  # Model input resolution (with NCNN backend)
+  # 640 = best for distance (~160ms)
+  # 416 = balanced (~100ms)
+  # 192 = close-range only (~50ms, fastest)
   input_size: 640
 
   # FP16 - not supported on Pi CPU, keep false
@@ -76,7 +78,7 @@ detector:
   # Performance: run detection every N frames (1 = every frame)
   # Higher values reduce CPU load, tracker interpolates between
   # Recommended: 3-5 for 30fps input (gives 6-10 detections/sec)
-  detection_interval: 10
+  detection_interval: 3
 
   # Detection resolution (downscale camera frame before detection)
   # This is independent of input_size - frame is resized to this first,
@@ -93,14 +95,13 @@ detector:
 
 # Target Tracking Configuration
 tracker:
-  # Tracking algorithm: centroid, sort, deepsort
-  algorithm: "centroid"
+  # Tracking algorithm: "centroid" (simple, fast) or "bytetrack" (Kalman, better occlusion handling)
+  algorithm: "bytetrack"
 
   # Max frames to keep tracking without detection
   max_disappeared: 30
 
-  # Distance threshold for object association (pixels)
-  # Higher value allows tracking faster-moving objects
+  # Distance threshold for object association (pixels, used by centroid tracker)
   max_distance: 150
 
   # Lock-on settings
@@ -112,6 +113,12 @@ tracker:
     # Frames without target before losing lock
     frames_to_unlock: 15
 
+  # ByteTrack-specific settings (only used when algorithm: "bytetrack")
+  bytetrack:
+    high_thresh: 0.5   # High confidence threshold for first association pass
+    low_thresh: 0.1    # Low confidence threshold for second pass (catches occluded objects)
+    match_thresh: 0.8  # IoU threshold for track-detection matching
+
 # PID Controller Configuration
 pid:
   # Yaw control (horizontal centering)
@@ -120,6 +127,8 @@ pid:
     ki: 0.01
     kd: 0.1
     max_rate: 30.0  # Max yaw rate in deg/sec
+    derivative_filter: 0.1  # Low-pass filter (0=heavy filtering, 1=none)
+    slew_rate: 60.0  # Max rate change per second (deg/sec^2)
 
   # Pitch control (vertical centering)
   pitch:
@@ -127,6 +136,8 @@ pid:
     ki: 0.01
     kd: 0.08
     max_rate: 20.0  # Max pitch rate in deg/sec
+    derivative_filter: 0.1
+    slew_rate: 40.0
 
   # Throttle control (distance/altitude)
   throttle:
@@ -134,6 +145,8 @@ pid:
     ki: 0.005
     kd: 0.05
     max_rate: 2.0  # Max climb rate in m/sec
+    derivative_filter: 0.2  # Less filtering for altitude (more responsive)
+    slew_rate: 4.0
 
   # Dead zone - no correction if target within this % of center
   dead_zone_percent: 5.0
@@ -206,9 +219,8 @@ output:
   # Encoding: h264, h265
   codec: "h264"
 
-  # Use Pi 5 hardware encoder (much faster, lower CPU)
-  # Requires v4l2-utils: sudo apt install v4l-utils
-  # Set to false for macOS/non-Pi testing
+  # Hardware encoding (Pi 5 does NOT have h264_v4l2m2m, uses libx264)
+  # This setting is currently unused - software encoding is always used
   hardware_encode: false
 
   # Overlay settings

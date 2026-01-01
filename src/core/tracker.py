@@ -53,18 +53,23 @@ class TrackedObject:
 @dataclass
 class TrackerConfig:
     """Tracker configuration parameters."""
-    algorithm: str = "centroid"
+    algorithm: str = "centroid"  # "centroid" or "bytetrack"
     max_disappeared: int = 30
     max_distance: int = 100
     min_confidence: float = 0.6
     frames_to_lock: int = 5
     frames_to_unlock: int = 15
+    # ByteTrack-specific parameters
+    high_thresh: float = 0.5  # High confidence threshold for first association
+    low_thresh: float = 0.1  # Low confidence threshold for second association
+    match_thresh: float = 0.8  # IoU threshold for matching
 
     @classmethod
     def from_dict(cls, config: dict) -> "TrackerConfig":
         """Create config from dictionary."""
         tracker = config.get("tracker", {})
         lock_on = tracker.get("lock_on", {})
+        bytetrack = tracker.get("bytetrack", {})
         return cls(
             algorithm=tracker.get("algorithm", "centroid"),
             max_disappeared=tracker.get("max_disappeared", 30),
@@ -72,6 +77,9 @@ class TrackerConfig:
             min_confidence=lock_on.get("min_confidence", 0.6),
             frames_to_lock=lock_on.get("frames_to_lock", 5),
             frames_to_unlock=lock_on.get("frames_to_unlock", 15),
+            high_thresh=bytetrack.get("high_thresh", 0.5),
+            low_thresh=bytetrack.get("low_thresh", 0.1),
+            match_thresh=bytetrack.get("match_thresh", 0.8),
         )
 
 
@@ -124,18 +132,18 @@ class CentroidTracker:
             # Match existing objects to new detections
             object_ids = tuple(self._objects.keys())  # tuple is lighter than list
 
-            # Fast distance calculation without scipy
+            # Vectorized distance calculation using NumPy broadcasting
             # Use squared distances to avoid sqrt
             n_obj = len(object_ids)
             n_det = len(detections)
-            D = np.empty((n_obj, n_det), dtype=np.float32)
 
-            for i, oid in enumerate(object_ids):
-                ox, oy = self._objects[oid].center
-                for j, det in enumerate(detections):
-                    dx = det.center[0] - ox
-                    dy = det.center[1] - oy
-                    D[i, j] = dx * dx + dy * dy  # Squared distance
+            # Build center arrays for vectorized computation
+            obj_centers = np.array([self._objects[oid].center for oid in object_ids], dtype=np.float32)
+            det_centers = np.array([det.center for det in detections], dtype=np.float32)
+
+            # Broadcast: (n_obj, 1, 2) - (1, n_det, 2) = (n_obj, n_det, 2)
+            diff = obj_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :]
+            D = np.sum(diff * diff, axis=2)  # Squared distances (n_obj, n_det)
 
             max_dist_sq = self.max_distance * self.max_distance
 
@@ -238,6 +246,478 @@ class CentroidTracker:
         self._next_object_id = 0
 
 
+# =============================================================================
+# ByteTrack Implementation
+# =============================================================================
+
+class KalmanFilter:
+    """
+    Simple Kalman filter for bounding box tracking.
+
+    State vector: [cx, cy, aspect_ratio, height, vx, vy, va, vh]
+    Measurement: [cx, cy, aspect_ratio, height]
+    """
+
+    def __init__(self):
+        # State transition matrix (constant velocity model)
+        self._motion_mat = np.eye(8, dtype=np.float32)
+        for i in range(4):
+            self._motion_mat[i, i + 4] = 1.0
+
+        # Measurement matrix
+        self._update_mat = np.eye(4, 8, dtype=np.float32)
+
+        # Process noise (tuned for typical video tracking)
+        self._std_weight_position = 1.0 / 20
+        self._std_weight_velocity = 1.0 / 160
+
+    def initiate(self, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Initialize track from first detection.
+
+        Args:
+            measurement: [cx, cy, aspect_ratio, height]
+
+        Returns:
+            (mean, covariance) tuple
+        """
+        mean_pos = measurement
+        mean_vel = np.zeros(4, dtype=np.float32)
+        mean = np.concatenate([mean_pos, mean_vel])
+
+        # Initial covariance
+        std = [
+            2 * self._std_weight_position * measurement[3],
+            2 * self._std_weight_position * measurement[3],
+            1e-2,
+            2 * self._std_weight_position * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            10 * self._std_weight_velocity * measurement[3],
+            1e-5,
+            10 * self._std_weight_velocity * measurement[3],
+        ]
+        covariance = np.diag(np.square(std).astype(np.float32))
+
+        return mean, covariance
+
+    def predict(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Predict next state."""
+        std = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-2,
+            self._std_weight_position * mean[3],
+            self._std_weight_velocity * mean[3],
+            self._std_weight_velocity * mean[3],
+            1e-5,
+            self._std_weight_velocity * mean[3],
+        ]
+        motion_cov = np.diag(np.square(std).astype(np.float32))
+
+        mean = self._motion_mat @ mean
+        covariance = self._motion_mat @ covariance @ self._motion_mat.T + motion_cov
+
+        return mean, covariance
+
+    def update(
+        self, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Update state with new measurement."""
+        std = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-1,
+            self._std_weight_position * mean[3],
+        ]
+        innovation_cov = np.diag(np.square(std).astype(np.float32))
+
+        # Project state to measurement space
+        projected_mean = self._update_mat @ mean
+        projected_cov = self._update_mat @ covariance @ self._update_mat.T + innovation_cov
+
+        # Kalman gain
+        chol = np.linalg.cholesky(projected_cov)
+        kalman_gain = np.linalg.solve(
+            chol.T, np.linalg.solve(chol, (covariance @ self._update_mat.T).T)
+        ).T
+
+        # Update
+        innovation = measurement - projected_mean
+        new_mean = mean + kalman_gain @ innovation
+        new_covariance = covariance - kalman_gain @ projected_cov @ kalman_gain.T
+
+        return new_mean, new_covariance
+
+
+class STrack:
+    """Single object track for ByteTrack."""
+
+    _count = 0
+    shared_kalman = KalmanFilter()
+
+    def __init__(self, detection: Detection):
+        self.track_id = 0  # Assigned when activated
+        self.is_activated = False
+        self.state = "new"  # new, tracked, lost, removed
+
+        # Detection info
+        self.class_name = detection.class_name
+        self.score = detection.confidence
+        self.bbox = detection.bbox  # x1, y1, x2, y2
+
+        # Kalman state
+        self.mean: Optional[np.ndarray] = None
+        self.covariance: Optional[np.ndarray] = None
+
+        # Frame counters
+        self.frame_id = 0
+        self.start_frame = 0
+        self.tracklet_len = 0
+
+    @staticmethod
+    def next_id() -> int:
+        STrack._count += 1
+        return STrack._count
+
+    @staticmethod
+    def reset_id() -> None:
+        STrack._count = 0
+
+    def activate(self, frame_id: int) -> None:
+        """Activate a new track."""
+        self.track_id = STrack.next_id()
+        self.is_activated = True
+        self.state = "tracked"
+        self.frame_id = frame_id
+        self.start_frame = frame_id
+        self.tracklet_len = 0
+
+        # Initialize Kalman filter
+        measurement = self._bbox_to_xyah(self.bbox)
+        self.mean, self.covariance = self.shared_kalman.initiate(measurement)
+
+    def re_activate(self, detection: Detection, frame_id: int, new_id: bool = False) -> None:
+        """Re-activate a lost track."""
+        self.bbox = detection.bbox
+        self.score = detection.confidence
+        self.class_name = detection.class_name
+        self.state = "tracked"
+        self.is_activated = True
+        self.frame_id = frame_id
+        self.tracklet_len = 0
+
+        measurement = self._bbox_to_xyah(self.bbox)
+        self.mean, self.covariance = self.shared_kalman.update(
+            self.mean, self.covariance, measurement
+        )
+
+        if new_id:
+            self.track_id = STrack.next_id()
+
+    def predict(self) -> None:
+        """Predict next state using Kalman filter."""
+        if self.mean is not None and self.covariance is not None:
+            self.mean, self.covariance = self.shared_kalman.predict(self.mean, self.covariance)
+
+    def update(self, detection: Detection, frame_id: int) -> None:
+        """Update track with matched detection."""
+        self.bbox = detection.bbox
+        self.score = detection.confidence
+        self.class_name = detection.class_name
+        self.state = "tracked"
+        self.is_activated = True
+        self.frame_id = frame_id
+        self.tracklet_len += 1
+
+        measurement = self._bbox_to_xyah(self.bbox)
+        self.mean, self.covariance = self.shared_kalman.update(
+            self.mean, self.covariance, measurement
+        )
+
+    def mark_lost(self) -> None:
+        """Mark track as lost."""
+        self.state = "lost"
+
+    def mark_removed(self) -> None:
+        """Mark track as removed."""
+        self.state = "removed"
+
+    @property
+    def center(self) -> Tuple[int, int]:
+        """Get bounding box center."""
+        x1, y1, x2, y2 = self.bbox
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+    @property
+    def predicted_bbox(self) -> Tuple[int, int, int, int]:
+        """Get predicted bounding box from Kalman state."""
+        if self.mean is None:
+            return self.bbox
+        return self._xyah_to_bbox(self.mean[:4])
+
+    def _bbox_to_xyah(self, bbox: Tuple[int, int, int, int]) -> np.ndarray:
+        """Convert bbox (x1,y1,x2,y2) to (cx, cy, aspect_ratio, height)."""
+        x1, y1, x2, y2 = bbox
+        w = x2 - x1
+        h = max(1, y2 - y1)
+        cx = x1 + w / 2
+        cy = y1 + h / 2
+        return np.array([cx, cy, w / h, h], dtype=np.float32)
+
+    def _xyah_to_bbox(self, xyah: np.ndarray) -> Tuple[int, int, int, int]:
+        """Convert (cx, cy, aspect_ratio, height) to bbox (x1,y1,x2,y2)."""
+        cx, cy, a, h = xyah
+        w = a * h
+        x1 = int(cx - w / 2)
+        y1 = int(cy - h / 2)
+        x2 = int(cx + w / 2)
+        y2 = int(cy + h / 2)
+        return (x1, y1, x2, y2)
+
+
+class ByteTracker:
+    """
+    ByteTrack multi-object tracker.
+
+    Key features:
+    - Two-stage association: high confidence first, then low confidence
+    - Kalman filter for motion prediction
+    - Handles occlusions and ID switches better than centroid tracking
+    """
+
+    def __init__(
+        self,
+        max_disappeared: int = 30,
+        max_distance: int = 100,
+        high_thresh: float = 0.5,
+        low_thresh: float = 0.1,
+        match_thresh: float = 0.8,
+    ):
+        self.max_disappeared = max_disappeared
+        self.max_distance = max_distance
+        self.high_thresh = high_thresh
+        self.low_thresh = low_thresh
+        self.match_thresh = match_thresh
+
+        self._tracked_stracks: List[STrack] = []
+        self._lost_stracks: List[STrack] = []
+        self._removed_stracks: List[STrack] = []
+        self._frame_id = 0
+
+    @property
+    def objects(self) -> Dict[int, TrackedObject]:
+        """Get all active tracked objects (compatible with CentroidTracker interface)."""
+        result = {}
+        for track in self._tracked_stracks:
+            if track.is_activated:
+                result[track.track_id] = TrackedObject(
+                    object_id=track.track_id,
+                    class_name=track.class_name,
+                    center=track.center,
+                    bbox=track.bbox,
+                    confidence=track.score,
+                    frames_visible=track.tracklet_len,
+                    frames_missing=0,
+                    velocity=self._estimate_velocity(track),
+                    last_update=time.time(),
+                )
+        return result
+
+    def _estimate_velocity(self, track: STrack) -> Tuple[float, float]:
+        """Estimate velocity from Kalman state."""
+        if track.mean is not None and len(track.mean) >= 6:
+            # vx, vy are in state indices 4, 5
+            return (float(track.mean[4]), float(track.mean[5]))
+        return (0.0, 0.0)
+
+    def update(self, detections: List[Detection]) -> Dict[int, TrackedObject]:
+        """Update tracker with new detections."""
+        self._frame_id += 1
+
+        # Predict all tracked stracks
+        for track in self._tracked_stracks:
+            track.predict()
+        for track in self._lost_stracks:
+            track.predict()
+
+        # Split detections by confidence and create STracks in single pass
+        # This avoids 4 separate list comprehensions (2 filters + 2 STrack creates)
+        high_dets = []
+        low_dets = []
+        high_stracks = []
+        low_stracks = []
+        for d in detections:
+            conf = d.confidence
+            if conf >= self.high_thresh:
+                high_dets.append(d)
+                high_stracks.append(STrack(d))
+            elif conf >= self.low_thresh:
+                low_dets.append(d)
+                low_stracks.append(STrack(d))
+
+        # Partition tracked stracks in single pass (avoids 2 list comprehensions)
+        unconfirmed = []
+        tracked = []
+        for t in self._tracked_stracks:
+            if t.is_activated:
+                tracked.append(t)
+            else:
+                unconfirmed.append(t)
+
+        # Combine tracked and lost for matching
+        strack_pool = tracked + self._lost_stracks
+
+        # Match high confidence detections
+        matched, unmatched_tracks, unmatched_dets = self._associate(
+            strack_pool, high_stracks, self.match_thresh
+        )
+
+        # Update matched tracks
+        for track_idx, det_idx in matched:
+            track = strack_pool[track_idx]
+            det = high_dets[det_idx]
+            if track.state == "tracked":
+                track.update(Detection(
+                    class_id=0, class_name=det.class_name, confidence=det.confidence,
+                    bbox=det.bbox, center=det.center
+                ), self._frame_id)
+            else:
+                track.re_activate(Detection(
+                    class_id=0, class_name=det.class_name, confidence=det.confidence,
+                    bbox=det.bbox, center=det.center
+                ), self._frame_id)
+
+        # --- Second association: low confidence with remaining tracked ---
+        remaining_tracks = [strack_pool[i] for i in unmatched_tracks if strack_pool[i].state == "tracked"]
+        matched2, unmatched_tracks2, _ = self._associate(
+            remaining_tracks, low_stracks, 0.5  # Lower threshold for low-conf
+        )
+
+        for track_idx, det_idx in matched2:
+            track = remaining_tracks[track_idx]
+            det = low_dets[det_idx]
+            track.update(Detection(
+                class_id=0, class_name=det.class_name, confidence=det.confidence,
+                bbox=det.bbox, center=det.center
+            ), self._frame_id)
+
+        # Mark unmatched tracks as lost
+        # Build set of matched track indices from second association for O(1) lookup
+        matched2_track_indices = {track_idx for track_idx, _ in matched2}
+        for idx in unmatched_tracks:
+            track = strack_pool[idx]
+            if track.state == "tracked":
+                # Check if this track is in remaining_tracks and was matched in second pass
+                track_in_remaining = track in remaining_tracks
+                if not track_in_remaining:
+                    track.mark_lost()
+                else:
+                    remaining_idx = remaining_tracks.index(track)
+                    if remaining_idx not in matched2_track_indices:
+                        track.mark_lost()
+
+        # Handle unconfirmed tracks
+        # Build list of unmatched high-conf STracks for association with unconfirmed
+        unmatched_high_stracks = [high_stracks[i] for i in unmatched_dets]
+        matched_unconf, unmatched_unconf, unmatched_from_high = self._associate(
+            unconfirmed, unmatched_high_stracks, 0.7
+        )
+        for track_idx, det_idx in matched_unconf:
+            # det_idx is index into unmatched_high_stracks
+            original_det_idx = unmatched_dets[det_idx]
+            unconfirmed[track_idx].update(
+                high_dets[original_det_idx], self._frame_id
+            )
+        for idx in unmatched_unconf:
+            unconfirmed[idx].mark_removed()
+
+        # Initialize new tracks from unmatched high-confidence detections
+        for idx in unmatched_from_high:
+            # idx is index into unmatched_high_stracks, map back to original
+            original_det_idx = unmatched_dets[idx]
+            if original_det_idx < len(high_dets) and high_dets[original_det_idx].confidence >= self.high_thresh:
+                # Use the STrack from unmatched_high_stracks (same as high_stracks[original_det_idx])
+                new_track = unmatched_high_stracks[idx]
+                new_track.activate(self._frame_id)
+                self._tracked_stracks.append(new_track)
+
+        # Update track lists
+        self._tracked_stracks = [t for t in self._tracked_stracks if t.state == "tracked"]
+
+        # Move lost tracks
+        for track in strack_pool:
+            if track.state == "lost" and track not in self._lost_stracks:
+                self._lost_stracks.append(track)
+
+        # Remove tracks lost for too long
+        self._lost_stracks = [
+            t for t in self._lost_stracks
+            if self._frame_id - t.frame_id <= self.max_disappeared and t.state != "removed"
+        ]
+
+        return self.objects
+
+    def _associate(
+        self,
+        tracks: List[STrack],
+        detections: List[STrack],
+        thresh: float,
+    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+        """Associate tracks with detections using IoU."""
+        if len(tracks) == 0 or len(detections) == 0:
+            return [], list(range(len(tracks))), list(range(len(detections)))
+
+        # Compute IoU distance matrix
+        cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float32)
+        for i, track in enumerate(tracks):
+            for j, det in enumerate(detections):
+                iou = self._compute_iou(track.predicted_bbox, det.bbox)
+                cost_matrix[i, j] = 1.0 - iou
+
+        # Simple greedy matching (could use Hungarian algorithm for optimality)
+        matched = []
+        unmatched_tracks = set(range(len(tracks)))
+        unmatched_dets = set(range(len(detections)))
+
+        # Sort by cost and greedily assign
+        indices = np.unravel_index(np.argsort(cost_matrix, axis=None), cost_matrix.shape)
+        for i, j in zip(indices[0], indices[1]):
+            if i in unmatched_tracks and j in unmatched_dets:
+                if cost_matrix[i, j] <= thresh:
+                    matched.append((i, j))
+                    unmatched_tracks.discard(i)
+                    unmatched_dets.discard(j)
+
+        return matched, list(unmatched_tracks), list(unmatched_dets)
+
+    def _compute_iou(
+        self,
+        bbox1: Tuple[int, int, int, int],
+        bbox2: Tuple[int, int, int, int],
+    ) -> float:
+        """Compute Intersection over Union."""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - inter
+
+        if union <= 0:
+            return 0.0
+        return inter / union
+
+    def reset(self) -> None:
+        """Reset tracker state."""
+        self._tracked_stracks.clear()
+        self._lost_stracks.clear()
+        self._removed_stracks.clear()
+        self._frame_id = 0
+        STrack.reset_id()
+
+
 class TargetTracker:
     """
     High-level target tracker with lock-on capability.
@@ -253,11 +733,22 @@ class TargetTracker:
         self.frame_height = max(1, frame_size[1])
         self.frame_center = (self.frame_width // 2, self.frame_height // 2)
 
-        # Initialize centroid tracker
-        self._tracker = CentroidTracker(
-            max_disappeared=config.max_disappeared,
-            max_distance=config.max_distance,
-        )
+        # Initialize tracker based on algorithm selection
+        if config.algorithm.lower() == "bytetrack":
+            logger.info("Using ByteTrack algorithm (Kalman + IoU matching)")
+            self._tracker = ByteTracker(
+                max_disappeared=config.max_disappeared,
+                max_distance=config.max_distance,
+                high_thresh=config.high_thresh,
+                low_thresh=config.low_thresh,
+                match_thresh=config.match_thresh,
+            )
+        else:
+            logger.info("Using Centroid tracker algorithm")
+            self._tracker = CentroidTracker(
+                max_disappeared=config.max_disappeared,
+                max_distance=config.max_distance,
+            )
 
         # Lock-on state
         self._state = TrackingState.SEARCHING

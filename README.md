@@ -4,74 +4,89 @@ Drone companion computer software for Raspberry Pi 5. Performs real-time object 
 
 ## Features
 
-- **YOLO11n Detection** - Object detection optimized for Pi 5 CPU (~30ms inference at 320px)
-- **Target Tracking** - Lock onto and follow specific objects (person, car, truck, boat)
-- **PID Control** - Automatic yaw/pitch adjustment to keep target centered
-- **UDP Video Stream** - H.264 video with overlay direct to QGroundControl (port 5600)
-- **Web Configuration** - Browser-based UI for tuning parameters (port 5000)
-- **MAVLink Integration** - Receives telemetry, sends rate commands to ArduPilot
-- **Auto-start** - Systemd service for headless operation
+- YOLO11n detection with NCNN backend (~160ms at 640px, ~100ms at 416px)
+- Target tracking with ByteTrack (Kalman filter) or centroid tracker
+- PID control for yaw/pitch adjustment to keep target centered
+- UDP H.264 video stream with overlay to QGroundControl (port 5600)
+- Web UI for configuration and control (port 5000)
+- MAVLink integration for telemetry and rate commands
+- Systemd service for headless operation
 
 ## Requirements
 
-- Raspberry Pi 5 (4GB+ RAM recommended)
+- Raspberry Pi 5 (4GB+ RAM)
 - Python 3.11+
-- FFmpeg with h264_v4l2m2m encoder
+- FFmpeg (uses libx264 software encoder)
 - Camera (USB, CSI, or RTSP stream)
 
 ## Quick Start
 
 ```bash
-# Clone and setup
 cd terminal_guidance
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Run
 python -m src.app
 
-# Or install as service (Pi only)
+# Or install as service
 ./scripts/install-service.sh
 ```
 
 ## Configuration
 
-Edit `config/default.yaml` to configure:
+Edit `config/default.yaml`:
 
-- **Camera** - RTSP URL, webcam index, or video file path
-- **Detection** - Model, confidence threshold, target classes, input size
-- **Tracking** - Lock-on thresholds, interpolation, max disappeared frames
-- **PID** - Yaw/pitch/throttle gains, dead zone, max rates
-- **MAVLink** - Flight controller connection string, system IDs
-- **Safety** - Target lost action, geofence, battery limits
-- **Stream** - Output resolution, bitrate, UDP destination
+- **camera** - RTSP URL, webcam index, or video file path
+- **detector** - Model, confidence threshold, target classes, input size
+- **tracker** - Algorithm (bytetrack/centroid), lock-on thresholds, max disappeared frames
+- **pid** - Yaw/pitch/throttle gains, dead zone, max rates, slew rate limiting
+- **mavlink** - Flight controller connection string, system IDs
+- **safety** - Target lost action, geofence, battery limits
+- **output** - Resolution, bitrate, UDP destination
 
 ### Key Settings
 
 ```yaml
 detector:
-  model: "yolo11n"           # YOLO11 nano - fastest for Pi 5 CPU
-  input_size: 320            # Model input (320, 416, or 640)
-  half_precision: false      # Keep false for CPU (FP16 hurts CPU performance)
-  detection_interval: 2      # Run detection every N frames
-  confidence_threshold: 0.5  # Minimum detection confidence
+  model: "yolo11n"
+  backend: "ncnn"
+  weights_path: "yolo11n_ncnn_model"
+  input_size: 640              # 192, 416, or 640
+  detection_interval: 3        # Run detection every N frames
+  confidence_threshold: 0.5
+  half_precision: false        # Not supported on Pi 5 CPU
 
 tracker:
-  max_disappeared: 30        # Frames before losing track
+  algorithm: "bytetrack"       # "bytetrack" or "centroid"
+  max_disappeared: 30
   lock_on:
-    frames_to_lock: 5        # Frames before confirming lock
-    frames_to_unlock: 15     # Frames without target before unlocking
+    frames_to_lock: 5
+    frames_to_unlock: 15
+  bytetrack:
+    high_thresh: 0.5
+    low_thresh: 0.1
+    match_thresh: 0.8
+
+pid:
+  yaw:
+    kp: 0.5
+    ki: 0.01
+    kd: 0.1
+    max_rate: 30.0
+    derivative_filter: 0.1     # Low-pass filter (0=heavy, 1=none)
+    slew_rate: 60.0            # Max rate change per second
+  dead_zone_percent: 5.0
 
 output:
   stream:
-    udp_host: "127.0.0.1"    # QGC address
-    udp_port: 5600           # QGC video port
-  hardware_encode: false     # Set true on Pi 5 for h264_v4l2m2m
+    udp_host: "192.168.1.129"
+    udp_port: 5600
+  bitrate_kbps: 2000
 
 mavlink:
   connection: "udp:192.168.1.1:14550"
-  enable_control: false      # Enable actual flight commands
+  enable_control: false
 
 safety:
   target_lost_action: "loiter"  # hover, loiter, rtl, land
@@ -84,23 +99,23 @@ safety:
 ## QGroundControl Setup
 
 1. Open QGC > Application Settings > Video
-2. Set **Video Source** = `UDP h.264 Video Stream`
-3. Set **Port** = `5600`
+2. Set Video Source = `UDP h.264 Video Stream`
+3. Set Port = `5600`
 
-Video feed will show detection overlay with:
+Video overlay shows:
 - Bounding boxes around detected objects
 - Lock indicator when tracking
-- Telemetry (FPS, inference time, altitude, battery, etc.)
-- Center crosshair for aiming reference
+- Telemetry (FPS, inference time, altitude, battery)
+- Center crosshair
 
 ## Web UI
 
-Access at `http://<pi-ip>:5000` to:
+Access at `http://<pi-ip>:5000`:
 
-- Monitor system status (FPS, inference time, targets)
-- Configure flight controller connection
-- Tune PID gains in real-time
-- Adjust detection parameters
+- System status (FPS, inference time, targets)
+- Flight controller connection config
+- PID gain tuning
+- Detection parameters
 - Lock/unlock targets
 - Enable/disable control output
 - Emergency stop
@@ -108,11 +123,11 @@ Access at `http://<pi-ip>:5000` to:
 ## Architecture
 
 ```
-Camera → Detection (YOLO11n) → Tracking → PID Controller → MAVLink
-                ↓
-         Overlay Renderer → FFmpeg → UDP/RTP → QGC
-                ↓
-              Web UI
+Camera -> Detection (YOLO11n) -> Tracking -> PID Controller -> MAVLink
+               |
+         Overlay Renderer -> FFmpeg -> UDP -> QGC
+               |
+            Web UI
 ```
 
 ### Components
@@ -121,10 +136,10 @@ Camera → Detection (YOLO11n) → Tracking → PID Controller → MAVLink
 |------|-------------|
 | `src/app.py` | Main application, coordinates all components |
 | `src/core/camera.py` | Video capture with auto-reconnection |
-| `src/core/detector.py` | YOLO inference wrapper |
-| `src/core/tracker.py` | Centroid tracker with lock-on state machine |
+| `src/core/detector.py` | YOLO inference wrapper (NCNN/OpenVINO/PyTorch) |
+| `src/core/tracker.py` | ByteTrack and centroid tracker with lock-on state machine |
 | `src/core/pipeline.py` | Async detection with velocity interpolation |
-| `src/core/pid.py` | PID controller for yaw/pitch/throttle |
+| `src/core/pid.py` | PID controller with derivative filtering and slew rate limiting |
 | `src/core/mavlink_controller.py` | ArduPilot communication |
 | `src/core/streamer.py` | FFmpeg UDP streaming with overlay |
 | `src/web/app.py` | Flask configuration UI |
@@ -133,30 +148,30 @@ Camera → Detection (YOLO11n) → Tracking → PID Controller → MAVLink
 
 | State | Description |
 |-------|-------------|
-| SEARCHING | No targets detected, scanning |
+| SEARCHING | No targets detected |
 | ACQUIRING | Target found, confirming lock (frames_to_lock) |
 | LOCKED | Target locked, PID control active |
 | LOST | Target disappeared, attempting re-identification |
 
 ## Performance
 
-On Raspberry Pi 5 (CPU-only, no GPU):
+Raspberry Pi 5 with NCNN backend (CPU-only):
 
-| Input Size | Detection Interval | Inference Time | Notes |
-|------------|-------------------|----------------|-------|
-| 320px | 2 | ~30ms | Recommended |
-| 416px | 2 | ~50ms | Higher accuracy |
-| 320px | 1 | ~30ms | More responsive, higher CPU |
+| Input Size | Inference Time | Detection FPS |
+|------------|----------------|---------------|
+| 640px | ~160ms | ~6 |
+| 416px | ~100ms | ~10 |
+| 192px | ~50ms | ~20 |
 
-Key optimization notes:
-- `half_precision: false` - FP16 hurts CPU performance
-- `detection_interval: 2` - Skip frames to reduce CPU load
-- `detection_resolution: 320x240` - Downscale before inference
-- Velocity interpolation fills gaps between detections
+Notes:
+- NCNN backend provides ~4x speedup over PyTorch
+- `detection_interval: 3` skips frames; tracker interpolates between detections
+- FP16 not supported on Pi 5 CPU
+- Pipeline maintains 30 FPS output with velocity interpolation
 
 ## MAVLink Commands
 
-The system accepts custom commands from QGC via COMMAND_LONG:
+Custom commands from QGC via COMMAND_LONG:
 
 | Command | MAV_CMD | Description |
 |---------|---------|-------------|
@@ -169,46 +184,39 @@ The system accepts custom commands from QGC via COMMAND_LONG:
 ## Systemd Service
 
 ```bash
-# Install
 ./scripts/install-service.sh
 
-# Control
 sudo systemctl start terminal-guidance
 sudo systemctl stop terminal-guidance
 sudo systemctl status terminal-guidance
 
-# Logs
 journalctl -u terminal-guidance -f
 ```
 
 ## Development
 
 ```bash
-# Run tests
 pytest
 
-# Run with debug logging
 python -m src.app --log-level DEBUG
 
-# Disable web UI
 python -m src.app --no-web
 ```
 
 ### Testing on macOS
 
-The software can run on macOS for development:
 - Uses `h264_videotoolbox` or `libx264` encoder
-- Set `half_precision: false` (no GPU)
-- Set `hardware_encode: false`
+- Set `half_precision: false`
 - Use webcam index "0" as camera source
 
 ## Dependencies
 
-- `ultralytics` - YOLO11 inference
-- `opencv-python-headless` - Video capture and processing
-- `pymavlink` - MAVLink communication
-- `flask` - Web UI
-- `numpy`, `scipy` - Numerical operations
+- ultralytics - YOLO11 inference
+- opencv-python-headless - Video capture and processing
+- pymavlink - MAVLink communication
+- flask - Web UI
+- numpy, scipy - Numerical operations
+- psutil - System health monitoring
 
 ## License
 

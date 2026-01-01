@@ -100,9 +100,10 @@ class DetectionWorker:
                 logger.info("Detection worker stopped")
 
     def submit(self, frame: np.ndarray, timestamp: float, frame_id: int, orig_size: Tuple[int, int]) -> bool:
-        """Submit frame for detection. Resize happens in worker thread."""
+        """Submit frame for detection. Copies frame to prevent race conditions."""
         try:
-            self._input_queue.put_nowait((frame, timestamp, frame_id, orig_size))
+            # Must copy - caller may modify frame before we process it
+            self._input_queue.put_nowait((frame.copy(), timestamp, frame_id, orig_size))
             return True
         except Full:
             return False
@@ -149,12 +150,6 @@ class DetectionWorker:
 
                 total_worker_ms = (time.perf_counter() - unpack_start) * 1000
 
-                # DEBUG: Log timing breakdown for first few frames
-                if not hasattr(self, '_timing_logged'):
-                    self._timing_logged = 0
-                if self._timing_logged < 3:
-                    logger.info(f"[TIMING] Total={total_worker_ms:.0f}ms: Detect={detect_ms:.0f}ms (model={inference_ms:.0f}ms), Unpack={unpack_ms:.1f}ms, Package={package_ms:.1f}ms")
-                    self._timing_logged += 1
                 try:
                     self._output_queue.put_nowait(result)
                 except Full:
@@ -396,14 +391,26 @@ class Pipeline:
         return frame_data
 
     def _collect_detection_results(self) -> None:
-        """Check for and process completed detection results."""
-        try:
-            result = self._detection_worker.output_queue.get_nowait()
-        except Empty:
+        """Check for and process ALL completed detection results.
+
+        Drains the queue to prevent stale results from accumulating.
+        Only the most recent result is used for tracker state.
+        """
+        latest_result = None
+
+        # Drain all available results, keeping only the newest
+        while True:
+            try:
+                result = self._detection_worker.output_queue.get_nowait()
+                latest_result = result
+            except Empty:
+                break
+
+        if latest_result is None:
             return
 
         # Unpack tuple: (detections, timestamp, inference_ms, frame_id)
-        detections, timestamp, inference_ms, frame_id = result
+        detections, timestamp, inference_ms, frame_id = latest_result
 
         # Update tracker with new detections
         self.tracker.update(detections)

@@ -15,6 +15,8 @@ class PIDGains:
     ki: float = 0.01
     kd: float = 0.1
     max_output: float = 30.0
+    derivative_filter: float = 0.1  # Low-pass filter coefficient (0-1, lower = more filtering)
+    slew_rate: float = 0.0  # Max output change per second (0 = disabled)
 
     @classmethod
     def from_dict(cls, config: dict) -> "PIDGains":
@@ -24,6 +26,8 @@ class PIDGains:
             ki=config.get("ki", 0.01),
             kd=config.get("kd", 0.1),
             max_output=config.get("max_rate", 30.0),
+            derivative_filter=config.get("derivative_filter", 0.1),
+            slew_rate=config.get("slew_rate", 0.0),
         )
 
 
@@ -50,7 +54,7 @@ class PIDConfig:
 
 
 class PIDAxis:
-    """Single-axis PID controller with anti-windup."""
+    """Single-axis PID controller with anti-windup, derivative filtering, and slew rate limiting."""
 
     MIN_KI_FOR_LIMIT = 0.001  # Minimum ki to calculate meaningful integral limit
 
@@ -61,6 +65,8 @@ class PIDAxis:
         self._prev_measurement = 0.0  # For derivative-on-measurement
         self._prev_time: Optional[float] = None
         self._first_update = True
+        self._filtered_derivative = 0.0  # Low-pass filtered derivative
+        self._prev_output = 0.0  # For slew rate limiting
 
         # Anti-windup limit (cap at reasonable value for small ki)
         self._integral_limit = self._calculate_integral_limit(gains.ki, gains.max_output)
@@ -111,15 +117,19 @@ class PIDAxis:
         # Derivative term on measurement (avoids derivative kick on setpoint change)
         # Falls back to error derivative if no measurement provided
         if self._first_update:
-            d_term = 0.0
+            raw_derivative = 0.0
             self._first_update = False
         elif measurement != 0.0:
             # Derivative on measurement (negative because we want to oppose change)
-            derivative = -(measurement - self._prev_measurement) / dt
-            d_term = self.gains.kd * derivative
+            raw_derivative = -(measurement - self._prev_measurement) / dt
         else:
-            derivative = (error - self._prev_error) / dt
-            d_term = self.gains.kd * derivative
+            raw_derivative = (error - self._prev_error) / dt
+
+        # Low-pass filter on derivative to reduce noise sensitivity
+        # filter_coeff: 0 = heavy filtering (slow response), 1 = no filtering (noisy)
+        alpha = max(0.0, min(1.0, self.gains.derivative_filter))
+        self._filtered_derivative = alpha * raw_derivative + (1 - alpha) * self._filtered_derivative
+        d_term = self.gains.kd * self._filtered_derivative
 
         self._prev_error = error
         self._prev_measurement = measurement
@@ -128,6 +138,14 @@ class PIDAxis:
         output = p_term + i_term + d_term
         output = max(-self.gains.max_output, min(self.gains.max_output, output))
 
+        # Slew rate limiting (max change per second)
+        if self.gains.slew_rate > 0:
+            max_change = self.gains.slew_rate * dt
+            delta = output - self._prev_output
+            if abs(delta) > max_change:
+                output = self._prev_output + max_change * (1 if delta > 0 else -1)
+
+        self._prev_output = output
         return output
 
     def reset(self) -> None:
@@ -137,6 +155,8 @@ class PIDAxis:
         self._prev_measurement = 0.0
         self._prev_time = None
         self._first_update = True
+        self._filtered_derivative = 0.0
+        self._prev_output = 0.0
 
 
 @dataclass
@@ -180,6 +200,7 @@ class PIDController:
 
     def update_gains(self, axis: str, kp: float = None, ki: float = None,
                      kd: float = None, max_rate: float = None,
+                     derivative_filter: float = None, slew_rate: float = None,
                      reset_integral: bool = True) -> None:
         """Update gains for a specific axis.
 
@@ -189,6 +210,8 @@ class PIDController:
             ki: New integral gain (optional)
             kd: New derivative gain (optional)
             max_rate: New maximum output rate (optional)
+            derivative_filter: Low-pass filter coefficient for derivative (0-1, optional)
+            slew_rate: Max output change per second (optional, 0 = disabled)
             reset_integral: Whether to reset integral term (default True)
         """
         pid_axis = {"yaw": self._yaw, "pitch": self._pitch, "throttle": self._throttle}.get(axis)
@@ -219,6 +242,16 @@ class PIDController:
             else:
                 pid_axis.gains.max_output = max_rate
                 pid_axis._integral_limit = pid_axis._calculate_integral_limit(pid_axis.gains.ki, max_rate)
+        if derivative_filter is not None:
+            if derivative_filter < 0 or derivative_filter > 1:
+                logger.warning(f"Ignoring invalid derivative_filter={derivative_filter} for {axis} (must be 0-1)")
+            else:
+                pid_axis.gains.derivative_filter = derivative_filter
+        if slew_rate is not None:
+            if slew_rate < 0:
+                logger.warning(f"Ignoring negative slew_rate={slew_rate} for {axis}")
+            else:
+                pid_axis.gains.slew_rate = slew_rate
 
         # Reset integral to prevent windup issues from old accumulated error
         if reset_integral:

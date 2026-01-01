@@ -13,8 +13,9 @@ Functions:
 """
 
 import logging
+import re
 import time
-from typing import TYPE_CHECKING, Any, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import psutil
 from flask import Flask, Response, jsonify, render_template_string, request
@@ -23,6 +24,150 @@ if TYPE_CHECKING:
     from ..app import TerminalGuidance
 
 logger = logging.getLogger(__name__)
+
+# Input validation patterns and limits
+IP_ADDRESS_PATTERN = re.compile(
+    r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
+    r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+)
+HOSTNAME_PATTERN = re.compile(
+    r'^(?=.{1,253}$)(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)*'
+    r'(?!-)[A-Za-z0-9-]{1,63}(?<!-)$'
+)
+MAVLINK_CONNECTION_PATTERN = re.compile(
+    r'^(udp|tcp|serial):[\w./:@-]+$'
+)
+# Allowed schemes for camera URLs
+CAMERA_URL_SCHEMES = {'rtsp', 'http', 'https', 'file'}
+# Port range
+MIN_PORT = 1
+MAX_PORT = 65535
+# Bitrate limits (kbps)
+MIN_BITRATE = 100
+MAX_BITRATE = 50000
+
+
+def validate_ip_or_hostname(value: str) -> bool:
+    """Validate that a string is a valid IP address or hostname."""
+    if not value or not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value:
+        return False
+    # Check for valid IP address
+    if IP_ADDRESS_PATTERN.match(value):
+        return True
+    # Check for valid hostname
+    if HOSTNAME_PATTERN.match(value):
+        return True
+    return False
+
+
+def validate_port(value: Any) -> bool:
+    """Validate that a value is a valid port number."""
+    try:
+        port = int(value)
+        return MIN_PORT <= port <= MAX_PORT
+    except (ValueError, TypeError):
+        return False
+
+
+def validate_camera_url(url: str) -> Tuple[bool, Optional[str]]:
+    """Validate camera URL for safety.
+
+    Returns:
+        (is_valid, error_message) tuple
+    """
+    if not url or not isinstance(url, str):
+        return False, "Camera URL is required"
+
+    url = url.strip()
+
+    # Check for shell injection characters
+    dangerous_chars = [';', '|', '&', '$', '`', '\n', '\r']
+    for char in dangerous_chars:
+        if char in url:
+            return False, f"Invalid character in URL: {repr(char)}"
+
+    # Check URL scheme
+    if '://' in url:
+        scheme = url.split('://')[0].lower()
+        if scheme not in CAMERA_URL_SCHEMES:
+            return False, f"Unsupported URL scheme: {scheme}"
+    elif url.isdigit():
+        # Webcam index (0, 1, 2, etc.)
+        return True, None
+    else:
+        return False, "URL must include scheme (rtsp://, http://, etc.) or be a webcam index"
+
+    return True, None
+
+
+def validate_mavlink_connection(conn: str) -> Tuple[bool, Optional[str]]:
+    """Validate MAVLink connection string.
+
+    Returns:
+        (is_valid, error_message) tuple
+    """
+    if not conn or not isinstance(conn, str):
+        return False, "MAVLink connection string is required"
+
+    conn = conn.strip()
+
+    # Check for shell injection characters
+    dangerous_chars = [';', '|', '&', '$', '`', '\n', '\r', ' ']
+    for char in dangerous_chars:
+        if char in conn:
+            return False, f"Invalid character in connection string: {repr(char)}"
+
+    # Basic pattern validation
+    if not MAVLINK_CONNECTION_PATTERN.match(conn):
+        return False, "Connection must be format: udp:host:port, tcp:host:port, or serial:/dev/..."
+
+    return True, None
+
+
+def validate_network_config(config: dict) -> Tuple[bool, Optional[str]]:
+    """Validate network-related configuration values.
+
+    Returns:
+        (is_valid, error_message) tuple
+    """
+    # Validate camera URL if present
+    camera = config.get('camera', {})
+    if 'rtsp_url' in camera and camera['rtsp_url']:
+        valid, err = validate_camera_url(camera['rtsp_url'])
+        if not valid:
+            return False, f"Camera URL: {err}"
+
+    # Validate MAVLink connection if present
+    mavlink = config.get('mavlink', {})
+    if 'connection' in mavlink and mavlink['connection']:
+        valid, err = validate_mavlink_connection(mavlink['connection'])
+        if not valid:
+            return False, f"MAVLink: {err}"
+
+    # Validate stream settings if present
+    output = config.get('output', {})
+    stream = output.get('stream', {})
+
+    if 'udp_host' in stream and stream['udp_host']:
+        if not validate_ip_or_hostname(stream['udp_host']):
+            return False, "Stream host must be a valid IP address or hostname"
+
+    if 'udp_port' in stream:
+        if not validate_port(stream['udp_port']):
+            return False, f"Stream port must be between {MIN_PORT} and {MAX_PORT}"
+
+    if 'bitrate_kbps' in output:
+        try:
+            bitrate = int(output['bitrate_kbps'])
+            if not (MIN_BITRATE <= bitrate <= MAX_BITRATE):
+                return False, f"Bitrate must be between {MIN_BITRATE} and {MAX_BITRATE} kbps"
+        except (ValueError, TypeError):
+            return False, "Bitrate must be a number"
+
+    return True, None
 
 CONFIG_PAGE = """
 <!DOCTYPE html>
@@ -33,15 +178,16 @@ CONFIG_PAGE = """
     <title>Terminal Guidance</title>
     <style>
         :root {
-            --bg: #0d1117;
-            --card: #161b22;
-            --border: #30363d;
-            --text: #c9d1d9;
-            --text-dim: #8b949e;
-            --accent: #58a6ff;
-            --success: #3fb950;
-            --warning: #d29922;
-            --danger: #f85149;
+            --bg: #0a0e14;
+            --card: #12171f;
+            --card-hover: #1a2130;
+            --border: #252d3a;
+            --text: #e1e4e8;
+            --text-dim: #6e7a8a;
+            --accent: #4d9fff;
+            --success: #2dd4a0;
+            --warning: #f0b429;
+            --danger: #ff5c5c;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -49,63 +195,123 @@ CONFIG_PAGE = """
             background: var(--bg);
             color: var(--text);
             line-height: 1.5;
-            padding: 16px;
-            max-width: 800px;
+            padding: 20px;
+            max-width: 840px;
             margin: 0 auto;
         }
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 16px;
-            padding-bottom: 16px;
+            margin-bottom: 24px;
+            padding-bottom: 20px;
             border-bottom: 1px solid var(--border);
         }
-        h1 { font-size: 20px; font-weight: 600; }
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .logo svg { opacity: 0.9; }
+        h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.3px; }
         .status-badge {
-            padding: 4px 12px;
+            padding: 6px 14px;
             border-radius: 20px;
             font-size: 12px;
             font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 6px;
         }
-        .status-badge.ok { background: rgba(63, 185, 80, 0.2); color: var(--success); }
-        .status-badge.warn { background: rgba(210, 153, 34, 0.2); color: var(--warning); }
-        .status-badge.error { background: rgba(248, 81, 73, 0.2); color: var(--danger); }
+        .status-badge::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .status-badge.ok { background: rgba(45, 212, 160, 0.15); color: var(--success); }
+        .status-badge.warn { background: rgba(240, 180, 41, 0.15); color: var(--warning); }
+        .status-badge.error { background: rgba(255, 92, 92, 0.15); color: var(--danger); }
 
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
-        .stat-card {
+        .status-bar {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            margin-bottom: 24px;
+            padding: 16px 20px;
             background: var(--card);
             border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 12px;
+            border-radius: 10px;
         }
-        .stat-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
-        .stat-value { font-size: 24px; font-weight: 600; margin-top: 4px; }
-        .stat-value.ok { color: var(--success); }
-        .stat-value.warn { color: var(--warning); }
-        .stat-value.error { color: var(--danger); }
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 13px;
+        }
+        .status-item .label { color: var(--text-dim); }
+        .status-item .value { font-weight: 600; font-variant-numeric: tabular-nums; }
+        .status-item .value.ok { color: var(--success); }
+        .status-item .value.warn { color: var(--warning); }
+        .status-item .value.error { color: var(--danger); }
+        .status-sep { width: 1px; height: 20px; background: var(--border); }
+
+        .control-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0;
+        }
+        .tab {
+            padding: 10px 18px;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-dim);
+            background: none;
+            border: none;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            transition: color 0.15s;
+        }
+        .tab:hover { color: var(--text); }
+        .tab.active {
+            color: var(--accent);
+            border-bottom-color: var(--accent);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
 
         .card {
             background: var(--card);
             border: 1px solid var(--border);
-            border-radius: 8px;
+            border-radius: 10px;
             margin-bottom: 16px;
         }
         .card-header {
-            padding: 12px 16px;
+            padding: 14px 18px;
             border-bottom: 1px solid var(--border);
             font-weight: 600;
-            font-size: 14px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
+            font-size: 13px;
+            color: var(--text);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
-        .card-body { padding: 16px; }
+        .card-body { padding: 18px; }
 
         .form-row {
             display: flex;
             align-items: center;
-            margin-bottom: 12px;
+            margin-bottom: 14px;
         }
         .form-row:last-child { margin-bottom: 0; }
         .form-label {
@@ -115,260 +321,485 @@ CONFIG_PAGE = """
         }
         .form-input {
             width: 140px;
-            padding: 8px 12px;
+            padding: 9px 12px;
             background: var(--bg);
             border: 1px solid var(--border);
             border-radius: 6px;
             color: var(--text);
-            font-size: 14px;
+            font-size: 13px;
+            transition: border-color 0.15s, box-shadow 0.15s;
         }
         .form-input:focus {
             outline: none;
             border-color: var(--accent);
-            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.15);
+            box-shadow: 0 0 0 3px rgba(77, 159, 255, 0.12);
         }
-        .form-input.wide { width: 200px; }
+        .form-input.wide { width: 180px; }
 
-        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+        .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
         .btn {
-            padding: 10px 16px;
+            padding: 11px 18px;
             border: none;
-            border-radius: 6px;
-            font-size: 14px;
-            font-weight: 500;
+            border-radius: 8px;
+            font-size: 13px;
+            font-weight: 600;
             cursor: pointer;
             transition: all 0.15s;
         }
-        .btn:hover { filter: brightness(1.1); }
-        .btn:active { transform: scale(0.98); }
+        .btn:hover { filter: brightness(1.1); transform: translateY(-1px); }
+        .btn:active { transform: translateY(0) scale(0.98); }
         .btn-primary { background: var(--accent); color: #fff; }
-        .btn-success { background: var(--success); color: #fff; }
+        .btn-success { background: var(--success); color: #0a0e14; }
         .btn-danger { background: var(--danger); color: #fff; }
         .btn-outline {
             background: transparent;
             border: 1px solid var(--border);
             color: var(--text);
         }
-        .btn-outline:hover { background: var(--border); }
+        .btn-outline:hover { background: var(--card-hover); border-color: var(--text-dim); }
 
         .toast {
             position: fixed;
-            bottom: 20px;
-            right: 20px;
-            padding: 12px 20px;
-            border-radius: 8px;
-            font-size: 14px;
+            bottom: 24px;
+            right: 24px;
+            padding: 14px 22px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
             opacity: 0;
             transform: translateY(20px);
             transition: all 0.3s;
             z-index: 1000;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
         }
         .toast.show { opacity: 1; transform: translateY(0); }
-        .toast.success { background: var(--success); color: #fff; }
+        .toast.success { background: var(--success); color: #0a0e14; }
         .toast.error { background: var(--danger); color: #fff; }
 
         .section-title {
-            font-size: 11px;
+            font-size: 10px;
             color: var(--text-dim);
             text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 12px;
+            letter-spacing: 0.8px;
+            margin-bottom: 14px;
+            font-weight: 600;
         }
-        .divider { height: 1px; background: var(--border); margin: 16px 0; }
+        .divider { height: 1px; background: var(--border); margin: 18px 0; }
 
         .emergency-btn {
             width: 100%;
-            padding: 16px;
-            font-size: 16px;
+            padding: 18px;
+            font-size: 14px;
             text-transform: uppercase;
-            letter-spacing: 1px;
+            letter-spacing: 2px;
+            border-radius: 10px;
+            box-shadow: 0 0 0 0 rgba(255, 92, 92, 0.4);
+            animation: pulse-danger 2s infinite;
         }
+        @keyframes pulse-danger {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(255, 92, 92, 0.4); }
+            50% { box-shadow: 0 0 0 6px rgba(255, 92, 92, 0); }
+        }
+        .emergency-btn:hover { animation: none; }
+
+        .collapsible {
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .collapsible::after {
+            content: '';
+            border: solid var(--text-dim);
+            border-width: 0 2px 2px 0;
+            padding: 3px;
+            transform: rotate(45deg);
+            transition: transform 0.2s;
+        }
+        .collapsible.collapsed::after { transform: rotate(-45deg); }
+        .collapse-content {
+            max-height: 500px;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+        }
+        .collapse-content.collapsed { max-height: 0; }
+
+        .class-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 8px;
+        }
+        .class-checkbox {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+        .class-checkbox:hover { border-color: var(--accent); }
+        .class-checkbox input { accent-color: var(--accent); }
+        .class-checkbox.selected { border-color: var(--accent); background: rgba(77, 159, 255, 0.1); }
+        .class-checkbox span { font-size: 12px; }
+
+        .service-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+            gap: 10px;
+        }
+        .service-btn {
+            padding: 12px 16px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            justify-content: center;
+        }
+        .service-btn svg { width: 14px; height: 14px; }
+        .service-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 11px;
+            color: var(--text-dim);
+            margin-top: 6px;
+        }
+        .service-status .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--success);
+        }
+        .service-status .dot.off { background: var(--text-dim); }
 
         @media (max-width: 500px) {
-            .form-input { width: 100px; }
+            .form-input { width: 110px; }
             .form-input.wide { width: 140px; }
+            .btn { padding: 10px 14px; font-size: 12px; }
         }
     </style>
 </head>
 <body>
     <header>
-        <h1>Terminal Guidance</h1>
+        <div class="logo">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M12 2v4M12 18v4M2 12h4M18 12h4"/>
+                <path d="M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+            </svg>
+            <h1>Terminal Guidance</h1>
+        </div>
         <span class="status-badge" id="conn-badge">--</span>
     </header>
 
-    <div class="grid">
-        <div class="stat-card">
-            <div class="stat-label">State</div>
-            <div class="stat-value" id="st-state">--</div>
+    <div class="status-bar">
+        <div class="status-item">
+            <span class="label">State:</span>
+            <span class="value" id="st-state">--</span>
         </div>
-        <div class="stat-card">
-            <div class="stat-label">FPS</div>
-            <div class="stat-value" id="st-fps">--</div>
+        <div class="status-sep"></div>
+        <div class="status-item">
+            <span class="label">Targets:</span>
+            <span class="value" id="st-targets">0</span>
         </div>
-        <div class="stat-card">
-            <div class="stat-label">Targets</div>
-            <div class="stat-value" id="st-targets">0</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-label">Battery</div>
-            <div class="stat-value" id="st-battery">--</div>
+        <div class="status-sep"></div>
+        <div class="status-item">
+            <span class="label">FPS:</span>
+            <span class="value" id="st-fps">--</span>
         </div>
     </div>
 
-    <div class="card">
-        <div class="card-header">
-            <span>Flight Controller (UDPCI)</span>
-        </div>
-        <div class="card-body">
-            <div class="form-row">
-                <span class="form-label">FC IP Address</span>
-                <input type="text" class="form-input wide" id="fc-ip" placeholder="192.168.1.1">
-            </div>
-            <div class="form-row">
-                <span class="form-label">FC Port</span>
-                <input type="number" class="form-input" id="fc-port" placeholder="14550">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Enable Control</span>
-                <select class="form-input" id="mav-control">
-                    <option value="false">Disabled</option>
-                    <option value="true">Enabled</option>
-                </select>
-            </div>
-        </div>
+    <div class="control-bar">
+        <button class="btn btn-success" id="btn-control" onclick="toggleControl()">Enable Control</button>
+        <button class="btn btn-outline" onclick="lockTarget()">Lock Target</button>
+        <button class="btn btn-outline" onclick="unlockTarget()">Unlock</button>
+        <button class="btn btn-danger" id="btn-estop" onclick="emergencyStop()">E-Stop</button>
     </div>
 
-    <div class="card">
-        <div class="card-header">
-            <span>Video Stream</span>
-        </div>
-        <div class="card-body">
-            <div class="form-row">
-                <span class="form-label">UDP Destination IP</span>
-                <input type="text" class="form-input wide" id="stream-host" placeholder="192.168.1.100">
-            </div>
-            <div class="form-row">
-                <span class="form-label">UDP Port</span>
-                <input type="number" class="form-input" id="stream-port" placeholder="5600">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Bitrate (kbps)</span>
-                <input type="number" class="form-input" id="stream-bitrate" placeholder="2000">
-            </div>
-        </div>
+    <div class="tabs">
+        <button class="tab active" onclick="switchTab('tracking')">Tracking</button>
+        <button class="tab" onclick="switchTab('connection')">Connection</button>
+        <button class="tab" onclick="switchTab('pid')">PID Tuning</button>
+        <button class="tab" onclick="switchTab('services')">Services</button>
     </div>
 
-    <div class="card">
-        <div class="card-header">
-            <span>PID Controller</span>
+    <div id="tab-tracking" class="tab-content active">
+        <div class="card">
+            <div class="card-header">Detection</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Confidence</span>
+                    <input type="number" step="0.05" min="0.1" max="1.0" class="form-input" id="det-conf">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Interval (frames)</span>
+                    <input type="number" step="1" min="1" max="10" class="form-input" id="det-interval">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Input Size</span>
+                    <input type="number" step="32" min="160" max="640" class="form-input" id="det-size">
+                </div>
+            </div>
         </div>
-        <div class="card-body">
-            <div class="section-title">Yaw (Horizontal)</div>
-            <div class="form-row">
-                <span class="form-label">Kp</span>
-                <input type="number" step="0.01" class="form-input" id="yaw-kp">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Ki</span>
-                <input type="number" step="0.001" class="form-input" id="yaw-ki">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Kd</span>
-                <input type="number" step="0.01" class="form-input" id="yaw-kd">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Max Rate (deg/s)</span>
-                <input type="number" step="1" class="form-input" id="yaw-max">
-            </div>
 
-            <div class="divider"></div>
+        <div class="card">
+            <div class="card-header collapsible collapsed" onclick="toggleCollapse(this)">
+                Detection Classes <span id="class-count" style="font-weight: normal; font-size: 11px; opacity: 0.7;">(0 selected)</span>
+            </div>
+            <div class="card-body collapse-content collapsed">
+                <div class="section-title">Select classes to detect (empty = all)</div>
+                <div class="class-grid" id="class-grid">
+                    <!-- Populated by JS -->
+                </div>
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-outline" onclick="selectAllClasses()">Select All</button>
+                    <button class="btn btn-outline" onclick="clearAllClasses()">Clear All</button>
+                </div>
+            </div>
+        </div>
 
-            <div class="section-title">Pitch (Vertical)</div>
-            <div class="form-row">
-                <span class="form-label">Kp</span>
-                <input type="number" step="0.01" class="form-input" id="pitch-kp">
+        <div class="card">
+            <div class="card-header">Tracker</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Algorithm</span>
+                    <select class="form-input wide" id="tracker-algorithm">
+                        <option value="bytetrack">ByteTrack (Kalman)</option>
+                        <option value="centroid">Centroid (Simple)</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Lock after</span>
+                    <input type="number" step="1" min="1" max="30" class="form-input" id="tracker-lock-frames"> frames
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Unlock after</span>
+                    <input type="number" step="1" min="1" max="60" class="form-input" id="tracker-unlock-frames"> frames
+                </div>
             </div>
-            <div class="form-row">
-                <span class="form-label">Ki</span>
-                <input type="number" step="0.001" class="form-input" id="pitch-ki">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Kd</span>
-                <input type="number" step="0.01" class="form-input" id="pitch-kd">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Max Rate (deg/s)</span>
-                <input type="number" step="1" class="form-input" id="pitch-max">
-            </div>
+        </div>
 
-            <div class="divider"></div>
-
-            <div class="section-title">General</div>
-            <div class="form-row">
-                <span class="form-label">Dead Zone (%)</span>
-                <input type="number" step="0.5" class="form-input" id="pid-deadzone">
+        <div class="card">
+            <div class="card-header">Safety</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">On target lost</span>
+                    <select class="form-input wide" id="safety-lost-action">
+                        <option value="loiter">Loiter</option>
+                        <option value="hover">Hover</option>
+                        <option value="rtl">Return to Launch</option>
+                        <option value="land">Land</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Search timeout</span>
+                    <input type="number" step="1" class="form-input" id="safety-timeout"> sec
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Max distance</span>
+                    <input type="number" step="10" class="form-input" id="safety-distance"> m
+                </div>
             </div>
         </div>
     </div>
 
-    <div class="card">
-        <div class="card-header">
-            <span>Detection</span>
+    <div id="tab-connection" class="tab-content">
+        <div class="card">
+            <div class="card-header">Camera</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Source URL</span>
+                    <input type="text" class="form-input" style="width: 100%; max-width: 350px;" id="camera-url" placeholder="rtsp://user:pass@192.168.1.10/stream">
+                </div>
+            </div>
         </div>
-        <div class="card-body">
-            <div class="form-row">
-                <span class="form-label">Confidence Threshold</span>
-                <input type="number" step="0.05" min="0.1" max="1.0" class="form-input" id="det-conf">
+
+        <div class="card">
+            <div class="card-header">Flight Controller</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">MAVLink</span>
+                    <input type="text" class="form-input wide" id="fc-connection" placeholder="udp:192.168.1.1:14550">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Send Commands</span>
+                    <select class="form-input" id="mav-control">
+                        <option value="false">Disabled</option>
+                        <option value="true">Enabled</option>
+                    </select>
+                </div>
             </div>
-            <div class="form-row">
-                <span class="form-label">Detection Interval (frames)</span>
-                <input type="number" step="1" min="1" max="10" class="form-input" id="det-interval">
-            </div>
-            <div class="form-row">
-                <span class="form-label">Input Size (px)</span>
-                <input type="number" step="32" min="160" max="640" class="form-input" id="det-size">
+        </div>
+
+        <div class="card">
+            <div class="card-header">Video Stream</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Destination IP</span>
+                    <input type="text" class="form-input wide" id="stream-host" placeholder="192.168.1.100">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Port</span>
+                    <input type="number" class="form-input" id="stream-port" placeholder="5600">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Bitrate</span>
+                    <input type="number" class="form-input" id="stream-bitrate" placeholder="2000"> kbps
+                </div>
             </div>
         </div>
     </div>
 
-    <div class="card">
-        <div class="card-header">
-            <span>Safety</span>
+    <div id="tab-pid" class="tab-content">
+        <div class="card">
+            <div class="card-header">Yaw (Horizontal)</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Kp</span>
+                    <input type="number" step="0.01" class="form-input" id="yaw-kp">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Ki</span>
+                    <input type="number" step="0.001" class="form-input" id="yaw-ki">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Kd</span>
+                    <input type="number" step="0.01" class="form-input" id="yaw-kd">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Max Rate</span>
+                    <input type="number" step="1" class="form-input" id="yaw-max"> deg/s
+                </div>
+                <div class="form-row">
+                    <span class="form-label">D Filter</span>
+                    <input type="number" step="0.05" min="0" max="1" class="form-input" id="yaw-dfilter">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Slew Rate</span>
+                    <input type="number" step="5" min="0" class="form-input" id="yaw-slew">
+                </div>
+            </div>
         </div>
-        <div class="card-body">
-            <div class="form-row">
-                <span class="form-label">Target Lost Action</span>
-                <select class="form-input wide" id="safety-lost-action">
-                    <option value="loiter">Loiter</option>
-                    <option value="hover">Hover</option>
-                    <option value="rtl">Return to Launch</option>
-                    <option value="land">Land</option>
-                </select>
+
+        <div class="card">
+            <div class="card-header">Pitch (Vertical)</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Kp</span>
+                    <input type="number" step="0.01" class="form-input" id="pitch-kp">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Ki</span>
+                    <input type="number" step="0.001" class="form-input" id="pitch-ki">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Kd</span>
+                    <input type="number" step="0.01" class="form-input" id="pitch-kd">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Max Rate</span>
+                    <input type="number" step="1" class="form-input" id="pitch-max"> deg/s
+                </div>
+                <div class="form-row">
+                    <span class="form-label">D Filter</span>
+                    <input type="number" step="0.05" min="0" max="1" class="form-input" id="pitch-dfilter">
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Slew Rate</span>
+                    <input type="number" step="5" min="0" class="form-input" id="pitch-slew">
+                </div>
             </div>
-            <div class="form-row">
-                <span class="form-label">Search Timeout (sec)</span>
-                <input type="number" step="1" class="form-input" id="safety-timeout">
+        </div>
+
+        <div class="card">
+            <div class="card-header">General</div>
+            <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Dead Zone</span>
+                    <input type="number" step="0.5" class="form-input" id="pid-deadzone"> %
+                </div>
             </div>
-            <div class="form-row">
-                <span class="form-label">Min Battery (%)</span>
-                <input type="number" step="1" class="form-input" id="safety-battery">
+        </div>
+    </div>
+
+    <div id="tab-services" class="tab-content">
+        <div class="card">
+            <div class="card-header">Component Control</div>
+            <div class="card-body">
+                <div class="section-title">Restart individual components after config changes</div>
+                <div class="service-grid">
+                    <div>
+                        <button class="btn btn-outline service-btn" onclick="restartService('detector')">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 4v6h6M23 20v-6h-6"/>
+                                <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+                            </svg>
+                            Detector
+                        </button>
+                        <div class="service-status">
+                            <span class="dot" id="svc-detector-dot"></span>
+                            <span id="svc-detector-status">--</span>
+                        </div>
+                    </div>
+                    <div>
+                        <button class="btn btn-outline service-btn" onclick="restartService('camera')">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 4v6h6M23 20v-6h-6"/>
+                                <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+                            </svg>
+                            Camera
+                        </button>
+                        <div class="service-status">
+                            <span class="dot" id="svc-camera-dot"></span>
+                            <span id="svc-camera-status">--</span>
+                        </div>
+                    </div>
+                    <div>
+                        <button class="btn btn-outline service-btn" onclick="restartService('streamer')">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 4v6h6M23 20v-6h-6"/>
+                                <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+                            </svg>
+                            Streamer
+                        </button>
+                        <div class="service-status">
+                            <span class="dot" id="svc-streamer-dot"></span>
+                            <span id="svc-streamer-status">--</span>
+                        </div>
+                    </div>
+                    <div>
+                        <button class="btn btn-outline service-btn" onclick="restartService('mavlink')">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M1 4v6h6M23 20v-6h-6"/>
+                                <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/>
+                            </svg>
+                            MAVLink
+                        </button>
+                        <div class="service-status">
+                            <span class="dot" id="svc-mavlink-dot"></span>
+                            <span id="svc-mavlink-status">--</span>
+                        </div>
+                    </div>
+                </div>
             </div>
-            <div class="form-row">
-                <span class="form-label">Max Distance (m)</span>
-                <input type="number" step="10" class="form-input" id="safety-distance">
+        </div>
+
+        <div class="card">
+            <div class="card-header">Full System</div>
+            <div class="card-body">
+                <div class="section-title">Restart all components</div>
+                <div class="btn-row">
+                    <button class="btn btn-primary" onclick="restartService('all')">Restart All Services</button>
+                </div>
             </div>
         </div>
     </div>
 
     <div class="btn-row">
-        <button class="btn btn-primary" onclick="saveConfig()">Save Configuration</button>
-        <button class="btn btn-success" id="btn-control" onclick="toggleControl()">Enable Control</button>
-        <button class="btn btn-outline" onclick="lockTarget()">Auto-Lock Target</button>
-        <button class="btn btn-outline" onclick="unlockTarget()">Unlock</button>
-    </div>
-
-    <div style="margin-top: 24px;">
-        <button class="btn btn-danger emergency-btn" onclick="emergencyStop()">EMERGENCY STOP</button>
+        <button class="btn btn-primary" onclick="saveConfig()">Save Config</button>
     </div>
 
     <div class="toast" id="toast"></div>
@@ -376,6 +807,38 @@ CONFIG_PAGE = """
     <script>
         let controlEnabled = false;
         let config = {};
+        let selectedClasses = [];
+
+        // COCO 80 classes (YOLO11n, YOLOv8, YOLOv5 all use these)
+        const COCO_CLASSES = [
+            'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+            'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat',
+            'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack',
+            'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball',
+            'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket',
+            'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+            'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake',
+            'chair', 'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop',
+            'mouse', 'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+            'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier', 'toothbrush'
+        ];
+
+        function switchTab(name) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector(`.tab[onclick*="${name}"]`).classList.add('active');
+            document.getElementById('tab-' + name).classList.add('active');
+        }
+
+        function toggleCollapse(header) {
+            header.classList.toggle('collapsed');
+            header.nextElementSibling.classList.toggle('collapsed');
+        }
+
+        function updateClassCount() {
+            const count = selectedClasses.length;
+            document.getElementById('class-count').textContent = count === 0 ? '(all classes)' : `(${count} selected)`;
+        }
 
         function toast(msg, isError = false) {
             const t = document.getElementById('toast');
@@ -400,17 +863,13 @@ CONFIG_PAGE = """
                 const r = await fetch('/api/status');
                 const d = await r.json();
 
-                document.getElementById('st-state').textContent = d.tracking_state?.toUpperCase() || '--';
-                document.getElementById('st-state').className = 'stat-value ' +
-                    (d.tracking_state === 'locked' ? 'ok' : d.tracking_state === 'lost' ? 'error' : '');
+                const stateEl = document.getElementById('st-state');
+                const state = d.tracking_state?.toUpperCase() || '--';
+                stateEl.textContent = state;
+                stateEl.className = 'value ' + (d.tracking_state === 'locked' ? 'ok' : d.tracking_state === 'lost' ? 'error' : '');
 
                 document.getElementById('st-fps').textContent = (d.fps || 0).toFixed(1);
                 document.getElementById('st-targets').textContent = (d.targets || []).length;
-
-                const bat = d.battery || 0;
-                document.getElementById('st-battery').textContent = bat > 0 ? bat.toFixed(0) + '%' : '--';
-                document.getElementById('st-battery').className = 'stat-value ' +
-                    (bat > 30 ? 'ok' : bat > 15 ? 'warn' : bat > 0 ? 'error' : '');
 
                 const badge = document.getElementById('conn-badge');
                 badge.textContent = d.connected ? 'Connected' : 'Disconnected';
@@ -418,17 +877,41 @@ CONFIG_PAGE = """
 
                 controlEnabled = d.control_enabled;
                 const btn = document.getElementById('btn-control');
-                btn.textContent = controlEnabled ? 'Disable Control' : 'Enable Control';
+                btn.textContent = controlEnabled ? 'Disable' : 'Enable Control';
                 btn.className = 'btn ' + (controlEnabled ? 'btn-danger' : 'btn-success');
             } catch (e) { console.error(e); }
         }
 
-        function parseConnection(conn) {
-            // Parse "udp:IP:PORT" or "udpci:IP:PORT" format
-            if (!conn) return { ip: '', port: 14550 };
-            const match = conn.match(/^(?:udp(?:ci)?:)?([^:]+):(\\d+)$/i);
-            if (match) return { ip: match[1], port: parseInt(match[2]) };
-            return { ip: conn, port: 14550 };
+        function buildClassGrid() {
+            const grid = document.getElementById('class-grid');
+            grid.innerHTML = '';
+            COCO_CLASSES.forEach(cls => {
+                const label = document.createElement('label');
+                label.className = 'class-checkbox' + (selectedClasses.includes(cls) ? ' selected' : '');
+                label.innerHTML = `<input type="checkbox" value="${cls}" ${selectedClasses.includes(cls) ? 'checked' : ''}><span>${cls}</span>`;
+                label.querySelector('input').addEventListener('change', (e) => {
+                    if (e.target.checked) {
+                        if (!selectedClasses.includes(cls)) selectedClasses.push(cls);
+                        label.classList.add('selected');
+                    } else {
+                        selectedClasses = selectedClasses.filter(c => c !== cls);
+                        label.classList.remove('selected');
+                    }
+                    updateClassCount();
+                });
+                grid.appendChild(label);
+            });
+            updateClassCount();
+        }
+
+        function selectAllClasses() {
+            selectedClasses = [...COCO_CLASSES];
+            buildClassGrid();
+        }
+
+        function clearAllClasses() {
+            selectedClasses = [];
+            buildClassGrid();
         }
 
         async function loadConfig() {
@@ -436,10 +919,15 @@ CONFIG_PAGE = """
                 const r = await fetch('/api/config');
                 config = await r.json();
 
-                // Parse FC connection into IP and port
-                const fc = parseConnection(config.mavlink?.connection);
-                setVal('fc-ip', fc.ip);
-                setVal('fc-port', fc.port);
+                // Load target classes
+                selectedClasses = config.detector?.target_classes || [];
+                buildClassGrid();
+
+                // Camera
+                setVal('camera-url', config.camera?.rtsp_url);
+
+                // Flight controller - full connection string
+                setVal('fc-connection', config.mavlink?.connection);
                 document.getElementById('mav-control').value = config.mavlink?.enable_control ? 'true' : 'false';
 
                 setVal('stream-host', config.output?.stream?.udp_host);
@@ -450,13 +938,22 @@ CONFIG_PAGE = """
                 setVal('yaw-ki', config.pid?.yaw?.ki);
                 setVal('yaw-kd', config.pid?.yaw?.kd);
                 setVal('yaw-max', config.pid?.yaw?.max_rate);
+                setVal('yaw-dfilter', config.pid?.yaw?.derivative_filter);
+                setVal('yaw-slew', config.pid?.yaw?.slew_rate);
 
                 setVal('pitch-kp', config.pid?.pitch?.kp);
                 setVal('pitch-ki', config.pid?.pitch?.ki);
                 setVal('pitch-kd', config.pid?.pitch?.kd);
                 setVal('pitch-max', config.pid?.pitch?.max_rate);
+                setVal('pitch-dfilter', config.pid?.pitch?.derivative_filter);
+                setVal('pitch-slew', config.pid?.pitch?.slew_rate);
 
                 setVal('pid-deadzone', config.pid?.dead_zone_percent);
+
+                // Tracker settings
+                document.getElementById('tracker-algorithm').value = config.tracker?.algorithm || 'bytetrack';
+                setVal('tracker-lock-frames', config.tracker?.lock_on?.frames_to_lock);
+                setVal('tracker-unlock-frames', config.tracker?.lock_on?.frames_to_unlock);
 
                 setVal('det-conf', config.detector?.confidence_threshold);
                 setVal('det-interval', config.detector?.detection_interval);
@@ -464,7 +961,6 @@ CONFIG_PAGE = """
 
                 document.getElementById('safety-lost-action').value = config.safety?.target_lost_action || 'loiter';
                 setVal('safety-timeout', config.safety?.search_timeout);
-                setVal('safety-battery', config.safety?.min_battery_percent);
                 setVal('safety-distance', config.safety?.geofence?.max_distance_m);
             } catch (e) {
                 console.error(e);
@@ -473,13 +969,12 @@ CONFIG_PAGE = """
         }
 
         async function saveConfig() {
-            // Build connection string from IP and port
-            const fcIp = getVal('fc-ip', false) || '192.168.1.1';
-            const fcPort = getVal('fc-port') || 14550;
-
             const cfg = {
+                camera: {
+                    rtsp_url: getVal('camera-url', false),
+                },
                 mavlink: {
-                    connection: `udp:${fcIp}:${fcPort}`,
+                    connection: getVal('fc-connection', false),
                     enable_control: document.getElementById('mav-control').value === 'true',
                 },
                 output: {
@@ -490,19 +985,40 @@ CONFIG_PAGE = """
                     bitrate_kbps: getVal('stream-bitrate'),
                 },
                 pid: {
-                    yaw: { kp: getVal('yaw-kp'), ki: getVal('yaw-ki'), kd: getVal('yaw-kd'), max_rate: getVal('yaw-max') },
-                    pitch: { kp: getVal('pitch-kp'), ki: getVal('pitch-ki'), kd: getVal('pitch-kd'), max_rate: getVal('pitch-max') },
+                    yaw: {
+                        kp: getVal('yaw-kp'),
+                        ki: getVal('yaw-ki'),
+                        kd: getVal('yaw-kd'),
+                        max_rate: getVal('yaw-max'),
+                        derivative_filter: getVal('yaw-dfilter'),
+                        slew_rate: getVal('yaw-slew'),
+                    },
+                    pitch: {
+                        kp: getVal('pitch-kp'),
+                        ki: getVal('pitch-ki'),
+                        kd: getVal('pitch-kd'),
+                        max_rate: getVal('pitch-max'),
+                        derivative_filter: getVal('pitch-dfilter'),
+                        slew_rate: getVal('pitch-slew'),
+                    },
                     dead_zone_percent: getVal('pid-deadzone'),
+                },
+                tracker: {
+                    algorithm: document.getElementById('tracker-algorithm').value,
+                    lock_on: {
+                        frames_to_lock: getVal('tracker-lock-frames'),
+                        frames_to_unlock: getVal('tracker-unlock-frames'),
+                    },
                 },
                 detector: {
                     confidence_threshold: getVal('det-conf'),
                     detection_interval: getVal('det-interval'),
                     input_size: getVal('det-size'),
+                    target_classes: selectedClasses,
                 },
                 safety: {
                     target_lost_action: document.getElementById('safety-lost-action').value,
                     search_timeout: getVal('safety-timeout'),
-                    min_battery_percent: getVal('safety-battery'),
                     geofence: { max_distance_m: getVal('safety-distance') },
                 },
             };
@@ -554,9 +1070,36 @@ CONFIG_PAGE = """
             } catch (e) { toast('Failed: ' + e, true); }
         }
 
+        async function restartService(service) {
+            try {
+                const r = await fetch(`/api/restart/${service}`, { method: 'POST' });
+                const d = await r.json();
+                toast(d.status === 'ok' ? `${service} restarted` : (d.message || 'Failed'), d.status !== 'ok');
+                loadServiceStatus();
+            } catch (e) { toast('Failed: ' + e, true); }
+        }
+
+        async function loadServiceStatus() {
+            try {
+                const r = await fetch('/api/services/status');
+                const d = await r.json();
+                ['detector', 'camera', 'streamer', 'mavlink'].forEach(svc => {
+                    const dot = document.getElementById(`svc-${svc}-dot`);
+                    const status = document.getElementById(`svc-${svc}-status`);
+                    if (dot && status) {
+                        const isRunning = d[svc]?.running ?? false;
+                        dot.className = 'dot' + (isRunning ? '' : ' off');
+                        status.textContent = isRunning ? 'Running' : 'Stopped';
+                    }
+                });
+            } catch (e) { console.error(e); }
+        }
+
         loadConfig();
         loadStatus();
+        loadServiceStatus();
         setInterval(loadStatus, 2000);
+        setInterval(loadServiceStatus, 5000);
     </script>
 </body>
 </html>
@@ -654,6 +1197,11 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
         except ValueError as e:
             return api_response(False, message=str(e), status=400)
 
+        # Validate network parameters to prevent injection attacks
+        valid, err = validate_network_config(new_config)
+        if not valid:
+            return api_response(False, message=err, status=400)
+
         if guidance.update_config(new_config):
             return api_response(True, message="Configuration updated")
         return api_response(False, message="Failed to update config", status=400)
@@ -714,6 +1262,48 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
         """Clear emergency stop state."""
         guidance.clear_emergency()
         return api_response(True)
+
+    @app.route("/api/services/status")
+    def services_status() -> Response:
+        """Get status of all services."""
+        return jsonify({
+            "detector": {
+                "running": guidance._detector is not None and guidance._detector.is_initialized,
+            },
+            "camera": {
+                "running": guidance._camera is not None and guidance._camera.is_running,
+            },
+            "streamer": {
+                "running": guidance._streamer is not None and guidance._streamer.is_running,
+            },
+            "mavlink": {
+                "running": guidance._mavlink is not None and guidance._mavlink.is_connected,
+            },
+        })
+
+    @app.route("/api/restart/<service>", methods=["POST"])
+    def restart_service(service: str) -> Tuple[Response, int]:
+        """Restart a specific service or all services."""
+        valid_services = {"detector", "camera", "streamer", "mavlink", "all"}
+        if service not in valid_services:
+            return api_response(False, message=f"Invalid service: {service}", status=400)
+
+        try:
+            if service == "all":
+                guidance.restart_all()
+            elif service == "detector":
+                guidance.restart_detector()
+            elif service == "camera":
+                guidance.restart_camera()
+            elif service == "streamer":
+                guidance.restart_streamer()
+            elif service == "mavlink":
+                guidance.restart_mavlink()
+
+            return api_response(True, message=f"{service} restarted")
+        except Exception as e:
+            logger.error(f"Failed to restart {service}: {e}")
+            return api_response(False, message=str(e), status=500)
 
     @app.route("/api/health")
     def health_check() -> Response:

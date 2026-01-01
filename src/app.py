@@ -11,6 +11,12 @@ import time
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 from typing import Any, Dict, List, Optional
 
+# Constants
+MAX_CONSECUTIVE_ERRORS = 10
+FRAME_POLL_INTERVAL = 0.001  # seconds
+LOOP_SLEEP_INTERVAL = 0.001  # seconds
+PERF_LOG_INTERVAL = 100  # frames
+
 import numpy as np
 
 from .core.camera import CameraCapture, CameraConfig
@@ -66,7 +72,9 @@ class TerminalGuidance:
 
         # Detector
         det_config = DetectorConfig.from_dict(self.config)
+        logger.info(f"Using {det_config.backend.upper()} backend for detection")
         self._detector = ObjectDetector(det_config)
+
         if not self._detector.initialize():
             logger.error("Failed to initialize detector")
             return False
@@ -156,16 +164,15 @@ class TerminalGuidance:
         search_timeout = self.config.get("safety", {}).get("search_timeout", 10.0)
         cam_fps = self.config.get("camera", {}).get("fps", 30)
         target_frame_time = 1.0 / cam_fps
-        max_consecutive_errors = 10
 
         while self._running:
             loop_start = time.time()
 
             try:
-                # Get frame from camera
-                frame = self._camera.get_frame()
+                # Get frame from camera (no copy - we process immediately before next get)
+                frame = self._camera.get_frame(copy=False)
                 if frame is None:
-                    time.sleep(0.001)  # Reduced sleep for faster polling
+                    time.sleep(FRAME_POLL_INTERVAL)
                     continue
 
                 # Validate frame
@@ -180,8 +187,8 @@ class TerminalGuidance:
                 self._fps = self._pipeline.fps
                 self._inference_ms = self._pipeline.inference_ms
 
-                # Debug: log FPS every 100 frames
-                if self._pipeline._frame_count % 100 == 0:
+                # Debug: log FPS periodically
+                if self._pipeline._frame_count % PERF_LOG_INTERVAL == 0:
                     loop_now = time.time()
                     loop_ms = (loop_now - loop_start) * 1000
                     logger.info(f"[PERF] Cam: {self._camera.actual_fps:.1f}, Pipe: {self._fps:.1f}, Inf: {self._inference_ms:.0f}ms, Loop: {loop_ms:.0f}ms, Frames: {self._pipeline._frame_count}")
@@ -279,7 +286,7 @@ class TerminalGuidance:
                 consecutive_errors += 1
                 logger.error(f"Main loop error: {e}", exc_info=True)
 
-                if consecutive_errors >= max_consecutive_errors:
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     logger.critical(f"Too many consecutive errors ({consecutive_errors}), stopping")
                     self._running = False
                     break
@@ -417,6 +424,7 @@ class TerminalGuidance:
             # Track what changed for component restart
             restart_streamer = "output" in new_config and "stream" in new_config.get("output", {})
             restart_mavlink = "mavlink" in new_config
+            restart_detector = "detector" in new_config and "target_classes" in new_config.get("detector", {})
 
             def merge(base, update):
                 for key, value in update.items():
@@ -445,6 +453,11 @@ class TerminalGuidance:
                 self._mavlink.set_tracking_command_callback(self._handle_tracking_command)
                 self._mavlink.start()
 
+            # Restart detector if target_classes changed
+            if restart_detector and self._detector:
+                logger.info("Restarting detector with new target classes...")
+                self.restart_detector()
+
             # Update PID parameters in-place (no restart needed)
             if "pid" in new_config and self._pid:
                 pid_cfg = new_config["pid"]
@@ -459,6 +472,71 @@ class TerminalGuidance:
         except Exception as e:
             logger.error(f"Config update failed: {e}")
             return False
+
+    def restart_detector(self) -> None:
+        """Restart the detector with current config."""
+        logger.info("Restarting detector...")
+        if self._pipeline:
+            self._pipeline.stop()
+
+        if self._detector:
+            self._detector.shutdown()
+
+        det_config = DetectorConfig.from_dict(self.config)
+        self._detector = ObjectDetector(det_config)
+        self._detector.initialize()
+
+        # Restart pipeline with new detector
+        if self._tracker:
+            pipeline_config = PipelineConfig.from_dict(self.config)
+            self._pipeline = Pipeline(self._detector, self._tracker, pipeline_config)
+            self._pipeline.start()
+
+        logger.info("Detector restarted")
+
+    def restart_camera(self) -> None:
+        """Restart the camera with current config."""
+        logger.info("Restarting camera...")
+        if self._camera:
+            self._camera.stop()
+
+        cam_config = CameraConfig.from_dict(self.config)
+        self._camera = CameraCapture(cam_config)
+        self._camera.start()
+        logger.info("Camera restarted")
+
+    def restart_streamer(self) -> None:
+        """Restart the UDP streamer with current config."""
+        logger.info("Restarting streamer...")
+        if self._streamer:
+            self._streamer.stop()
+
+        stream_config = StreamerConfig.from_dict(self.config)
+        self._streamer = UDPStreamer(stream_config)
+        self._streamer.start()
+        logger.info("Streamer restarted")
+
+    def restart_mavlink(self) -> None:
+        """Restart the MAVLink controller with current config."""
+        logger.info("Restarting MAVLink...")
+        if self._mavlink:
+            self._mavlink.stop()
+
+        mav_config = MAVLinkConfig.from_dict(self.config)
+        safety_config = SafetyConfig.from_dict(self.config)
+        self._mavlink = MAVLinkController(mav_config, safety_config)
+        self._mavlink.set_tracking_command_callback(self._handle_tracking_command)
+        self._mavlink.start()
+        logger.info("MAVLink restarted")
+
+    def restart_all(self) -> None:
+        """Restart all services."""
+        logger.info("Restarting all services...")
+        self.restart_camera()
+        self.restart_detector()
+        self.restart_streamer()
+        self.restart_mavlink()
+        logger.info("All services restarted")
 
 
 def main():

@@ -12,11 +12,14 @@ Classes:
 """
 
 import logging
+import re
 import shutil
 import subprocess
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Deque, Dict, Optional, Tuple
 
 import cv2
@@ -25,6 +28,42 @@ import numpy as np
 from .tracker import TrackedObject, TrackingState
 
 logger = logging.getLogger(__name__)
+
+# Validation patterns for FFmpeg safety
+_IP_PATTERN = re.compile(
+    r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
+    r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
+)
+_HOSTNAME_PATTERN = re.compile(
+    r'^(?=.{1,253}$)(?:(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.)*'
+    r'(?!-)[A-Za-z0-9-]{1,63}(?<!-)$'
+)
+
+
+def _validate_stream_host(host: str) -> bool:
+    """Validate that host is a safe IP or hostname for FFmpeg."""
+    if not host or not isinstance(host, str):
+        return False
+    host = host.strip()
+    # Block shell injection characters
+    if any(c in host for c in [';', '|', '&', '$', '`', ' ', '\n', '\r', '"', "'"]):
+        return False
+    return bool(_IP_PATTERN.match(host) or _HOSTNAME_PATTERN.match(host))
+
+
+def _validate_stream_port(port: int) -> bool:
+    """Validate that port is a safe integer."""
+    try:
+        port_int = int(port)
+        return 1 <= port_int <= 65535
+    except (ValueError, TypeError):
+        return False
+
+
+@lru_cache(maxsize=256)
+def _get_text_size_cached(text: str, font: int, font_scale: float) -> Tuple[int, int]:
+    """Get text size with LRU caching (module-level for efficiency)."""
+    return cv2.getTextSize(text, font, font_scale, 1)[0]
 
 
 @dataclass
@@ -101,7 +140,6 @@ class OverlayRenderer:
     def __init__(self, config: OverlayConfig):
         self.config = config
         self._font = cv2.FONT_HERSHEY_SIMPLEX
-        self._text_cache: Dict[str, Tuple[int, int]] = {}
         self._frame_center: Optional[Tuple[int, int]] = None
 
     def render(
@@ -138,11 +176,7 @@ class OverlayRenderer:
                 color = self.COLOR_ACQUIRING
             self._draw_locked_target(frame, locked_target, color)
 
-        # Draw tracking info
-        if self.config.show_tracking_info:
-            self._draw_tracking_info(frame, tracking_state, locked_target, objects)
-
-        # Draw telemetry
+        # Draw telemetry (includes tracking info)
         if self.config.show_telemetry and telemetry:
             self._draw_telemetry(frame, telemetry)
 
@@ -212,17 +246,6 @@ class OverlayRenderer:
         # Label with "LOCKED"
         label = f"LOCKED: {target.class_name} {target.confidence:.0%}"
         self._draw_label(frame, label, x1, y1 - 5, color)
-
-    def _draw_tracking_info(
-        self,
-        frame: np.ndarray,
-        state: TrackingState,
-        locked: Optional[TrackedObject],
-        objects: Dict[int, TrackedObject],
-    ) -> None:
-        """Draw tracking status info in top-right (called by _draw_telemetry)."""
-        # Now handled in _draw_telemetry for unified top-right display
-        pass
 
     def _draw_telemetry(self, frame: np.ndarray, telemetry: dict) -> None:
         """Draw all metrics in top-right corner."""
@@ -295,19 +318,8 @@ class OverlayRenderer:
             y_offset += 20
 
     def _get_text_size(self, text: str) -> Tuple[int, int]:
-        """Get text size with LRU-style caching."""
-        if text not in self._text_cache:
-            size = cv2.getTextSize(
-                text, self._font, self.config.font_scale, 1
-            )[0]
-            # Use larger cache with LRU-style eviction (remove oldest half)
-            if len(self._text_cache) > 256:
-                # Keep the most recent 128 entries
-                keys_to_remove = list(self._text_cache.keys())[:128]
-                for key in keys_to_remove:
-                    del self._text_cache[key]
-            self._text_cache[text] = size
-        return self._text_cache[text]
+        """Get text size using module-level lru_cache for efficiency."""
+        return _get_text_size_cached(text, self._font, self.config.font_scale)
 
     def _draw_label(
         self,
@@ -340,7 +352,8 @@ class UDPStreamer:
     """
     Video streamer using FFmpeg to send H.264 over UDP to QGroundControl.
 
-    Uses h264_v4l2m2m hardware encoder on Raspberry Pi, libx264 fallback elsewhere.
+    Uses libx264 software encoder (Pi 5 has no hardware H.264 encoder).
+    On macOS, uses h264_videotoolbox if available.
     QGC Settings: Video Source = UDP h.264 Video Stream, Port = 5600
     """
 
@@ -348,9 +361,10 @@ class UDPStreamer:
         self.config = config
         self._renderer = OverlayRenderer(config.overlay)
         self._process: Optional[subprocess.Popen] = None
+        self._process_lock = threading.Lock()  # Protects _process access
         self._running = False
         self._write_thread: Optional[threading.Thread] = None
-        # Use deque with maxlen=1 for O(1) operations and auto-discard
+        # Use deque with maxlen=2 for O(1) operations and auto-discard oldest
         self._frame_queue: Deque[np.ndarray] = deque(maxlen=2)
         self._queue_lock = threading.Lock()
         self._frame_event = threading.Event()  # Signal new frame available
@@ -405,6 +419,16 @@ class UDPStreamer:
             logger.info("Video streaming disabled")
             return True
 
+        # Validate stream destination to prevent command injection
+        if not _validate_stream_host(self.config.udp_host):
+            logger.error(f"Invalid stream host: {self.config.udp_host!r}")
+            logger.error("Host must be a valid IP address or hostname without special characters")
+            return False
+
+        if not _validate_stream_port(self.config.udp_port):
+            logger.error(f"Invalid stream port: {self.config.udp_port}")
+            return False
+
         # Check for ffmpeg
         if not shutil.which("ffmpeg"):
             logger.warning("FFmpeg not found - video streaming disabled")
@@ -458,11 +482,20 @@ class UDPStreamer:
             )
 
             # Give FFmpeg a moment to start and check for immediate failure
-            import time
             time.sleep(0.5)
             if self._process.poll() is not None:
-                stderr = self._process.stderr.read().decode() if self._process.stderr else ""
-                logger.error(f"FFmpeg failed to start: {stderr[:500]}")
+                stderr_text = ""
+                try:
+                    if self._process.stderr:
+                        stderr_text = self._process.stderr.read().decode()
+                finally:
+                    # Close stderr to prevent resource leak
+                    if self._process.stderr:
+                        try:
+                            self._process.stderr.close()
+                        except Exception:
+                            pass
+                logger.error(f"FFmpeg failed to start: {stderr_text[:500]}")
                 self._process = None
                 return True  # Non-fatal
 
@@ -490,42 +523,50 @@ class UDPStreamer:
             self._write_thread.join(timeout=2.0)
             self._write_thread = None
 
-        if self._process:
-            try:
-                if self._process.stdin:
-                    self._process.stdin.close()
-                self._process.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                logger.warning("FFmpeg did not exit gracefully, killing")
-                self._process.kill()
-                self._process.wait(timeout=1.0)  # Wait for kill to complete
-            except Exception as e:
-                logger.warning(f"Error stopping FFmpeg: {e}")
-                self._process.kill()
+        with self._process_lock:
+            if self._process:
                 try:
-                    self._process.wait(timeout=1.0)
-                except Exception:
-                    pass  # Process may already be dead
-            finally:
-                # Close stderr to prevent resource leak
-                if self._process.stderr:
+                    if self._process.stdin:
+                        self._process.stdin.close()
+                    self._process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    logger.warning("FFmpeg did not exit gracefully, killing")
+                    self._process.kill()
+                    self._process.wait(timeout=1.0)  # Wait for kill to complete
+                except Exception as e:
+                    logger.warning(f"Error stopping FFmpeg: {e}")
+                    self._process.kill()
                     try:
-                        self._process.stderr.close()
-                    except Exception:
-                        pass
-                self._process = None
+                        self._process.wait(timeout=1.0)
+                    except Exception as wait_err:
+                        logger.debug(f"FFmpeg wait failed (process may be dead): {wait_err}")
+                finally:
+                    # Close stderr to prevent resource leak
+                    if self._process.stderr:
+                        try:
+                            self._process.stderr.close()
+                        except Exception as stderr_err:
+                            logger.debug(f"Failed to close stderr: {stderr_err}")
+                    self._process = None
 
         logger.info("Streamer stopped")
 
     def _write_loop(self) -> None:
-        """Background thread to write frames to FFmpeg."""
+        """Background thread to write frames to FFmpeg.
+
+        Optimized for minimal lock contention:
+        - Uses event signaling instead of polling
+        - Drains queue in batches to reduce lock acquisitions
+        - Writes outside the lock to maximize throughput
+        """
         while self._running:
-            # Check process state before waiting
-            if not self._process or self._process.poll() is not None:
-                break
+            # Check process state before waiting (with lock to prevent race)
+            with self._process_lock:
+                if not self._process or self._process.poll() is not None:
+                    break
 
             # Wait for frame signal with timeout
-            if not self._frame_event.wait(timeout=0.01):  # Tighter timeout
+            if not self._frame_event.wait(timeout=0.033):  # ~30fps timeout
                 continue
 
             self._frame_event.clear()
@@ -534,31 +575,36 @@ class UDPStreamer:
             if not self._running:
                 break
 
+            # Drain all available frames, write only the latest
             frame = None
             with self._queue_lock:
-                if self._frame_queue:
-                    frame = self._frame_queue.popleft()  # O(1) with deque
+                while self._frame_queue:
+                    frame = self._frame_queue.popleft()
 
-            if frame is not None and self._process and self._process.stdin:
-                try:
-                    self._process.stdin.write(frame.tobytes())
-                except BrokenPipeError:
-                    logger.warning("FFmpeg pipe broken")
-                    self._running = False
-                    break
-                except Exception as e:
-                    logger.warning(f"Write error: {e}")
-                    break
+            # Write with lock to prevent race with stop()
+            if frame is not None:
+                with self._process_lock:
+                    if self._process and self._process.stdin:
+                        try:
+                            self._process.stdin.write(frame.tobytes())
+                        except BrokenPipeError:
+                            logger.warning("FFmpeg pipe broken")
+                            self._running = False
+                            break
+                        except Exception as e:
+                            logger.warning(f"Write error: {e}")
+                            break
 
         # Check if process exited with error and log it
-        if self._process and self._process.poll() is not None:
-            try:
-                if self._process.stderr:
-                    stderr = self._process.stderr.read().decode()
-                    if stderr:
-                        logger.warning(f"FFmpeg exited: {stderr[-300:]}")
-            except Exception:
-                pass  # Ignore errors reading stderr on shutdown
+        with self._process_lock:
+            if self._process and self._process.poll() is not None:
+                try:
+                    if self._process.stderr:
+                        stderr = self._process.stderr.read().decode()
+                        if stderr:
+                            logger.warning(f"FFmpeg exited: {stderr[-300:]}")
+                except Exception as e:
+                    logger.debug(f"Could not read FFmpeg stderr: {e}")
 
     def render_overlay(
         self,
@@ -579,20 +625,34 @@ class UDPStreamer:
         locked_target: Optional[TrackedObject],
         tracking_state: TrackingState,
         telemetry: Optional[dict] = None,
+        _frame_is_owned: bool = False,
     ) -> None:
-        """Push a frame to the UDP stream (frame should already have overlay)."""
+        """Push a frame to the UDP stream (frame should already have overlay).
+
+        Args:
+            frame: The frame to push (with overlay already rendered).
+            objects: Tracked objects (unused, kept for API compatibility).
+            locked_target: Locked target (unused, kept for API compatibility).
+            tracking_state: Current tracking state (unused, kept for API compatibility).
+            telemetry: Telemetry dict (unused, kept for API compatibility).
+            _frame_is_owned: Internal flag. If True, frame is already a copy owned
+                by the caller and won't be modified. Skips the defensive copy.
+                Only use if you guarantee the frame won't be reused.
+        """
         if not self._running or not self._process:
             return
 
-        # Resize if needed for output resolution (avoid copy if same size)
+        # Resize if needed for output resolution (resize creates new array)
         if frame.shape[1] != self.config.width or frame.shape[0] != self.config.height:
             output = cv2.resize(frame, (self.config.width, self.config.height))
+        elif not _frame_is_owned:
+            # Must copy - frame may be overwritten by camera capture thread
+            # or reused by caller. This is the expected path when caller uses
+            # camera.get_frame(copy=False) for performance.
+            output = frame.copy()
         else:
-            # Only copy if not already contiguous
-            if frame.flags['C_CONTIGUOUS']:
-                output = frame
-            else:
-                output = np.ascontiguousarray(frame)
+            # Caller guarantees this frame is owned and won't be reused
+            output = frame
 
         # Add to queue - deque maxlen handles discarding old frames
         with self._queue_lock:

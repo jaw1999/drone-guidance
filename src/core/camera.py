@@ -71,6 +71,11 @@ class CameraCapture:
         return self._connected
 
     @property
+    def is_running(self) -> bool:
+        """Check if capture thread is running."""
+        return self._running
+
+    @property
     def frame_count(self) -> int:
         """Total frames captured."""
         return self._frame_count
@@ -168,9 +173,9 @@ class CameraCapture:
         """Get the latest frame (thread-safe).
 
         Args:
-            copy: If True, returns a copy (safe but slower).
-                  If False, returns a view that may be overwritten by capture thread.
-                  WARNING: copy=False is unsafe unless caller processes frame immediately.
+            copy: If True (default), returns a copy (safe for async processing).
+                  If False, returns a view - ONLY safe when caller processes
+                  frame completely before next get_frame() call.
 
         Returns:
             Frame as numpy array, or None if no frame available.
@@ -178,9 +183,10 @@ class CameraCapture:
         with self._frame_lock:
             if self._frame is None:
                 return None
-            # Always copy to prevent race condition where capture thread
-            # overwrites frame while caller is processing it
-            return self._frame.copy() if copy else np.ascontiguousarray(self._frame)
+            if copy:
+                return self._frame.copy()
+            # Return view directly - caller must process before next call
+            return self._frame
 
     def _capture_loop(self) -> None:
         """Main capture loop running in separate thread."""

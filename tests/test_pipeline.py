@@ -22,18 +22,12 @@ class TestPipelineConfig:
         sample_config["detector"]["detection_resolution"] = {
             "width": 640, "height": 480
         }
-        sample_config["detector"]["roi_detection"] = {
-            "enabled": True,
-            "padding_percent": 50.0,
-        }
 
         config = PipelineConfig.from_dict(sample_config)
 
         assert config.detection_interval == 3
         assert config.detection_width == 640
         assert config.detection_height == 480
-        assert config.roi_enabled is True
-        assert config.roi_padding_percent == 50.0
 
     def test_defaults(self):
         """Config has sensible defaults."""
@@ -41,7 +35,7 @@ class TestPipelineConfig:
 
         assert config.detection_interval == 3
         assert config.detection_width == 640
-        assert config.detection_height == 480
+        assert config.detection_height == 640
 
 
 class TestFrameData:
@@ -113,15 +107,17 @@ class TestTrackingInterpolator:
         assert result[2].center[0] == 497  # 500 - 5*0.5 (int)
 
     def test_interpolate_no_extrapolate_too_far(self, interpolator, sample_tracked_objects):
-        """Don't extrapolate more than 1 second."""
+        """Extrapolation is clamped to 0.5 seconds max."""
         now = time.time()
         interpolator.update_from_detection(sample_tracked_objects, now)
 
-        # Try to interpolate 2 seconds later
+        # Try to interpolate 2 seconds later - should clamp to 0.5s extrapolation
         result = interpolator.interpolate(now + 2.0)
 
-        # Should return original positions (no extrapolation)
-        assert result[1].center == sample_tracked_objects[1].center
+        # Object 1 has velocity (10, 5), clamped to 0.5s gives (105, 102)
+        # Using smoothed position (100.0, 100.0) + velocity * 0.5
+        assert result[1].center[0] == 105  # 100 + 10*0.5
+        assert result[1].center[1] == 102  # 100 + 5*0.5 (int)
 
     def test_bbox_moves_with_center(self, interpolator, sample_tracked_objects):
         """Bbox is updated to match new center position."""

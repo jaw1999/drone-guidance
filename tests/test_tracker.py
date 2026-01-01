@@ -1,6 +1,7 @@
 """Tests for target tracker module."""
 
 import pytest
+import time
 
 from src.core.detector import Detection
 from src.core.tracker import (
@@ -96,6 +97,8 @@ class TestCentroidTracker:
         det2 = [Detection(0, "person", 0.9, (120, 100, 220, 200), (170, 150))]
 
         tracker.update(det1)
+        # Need sufficient time delta for velocity calculation (MIN_VELOCITY_DT = 0.01s)
+        time.sleep(0.02)
         objects = tracker.update(det2)
 
         obj = list(objects.values())[0]
@@ -153,6 +156,9 @@ class TestTargetTracker:
         config.frames_to_lock = 2
         config.frames_to_unlock = 3
         config.min_confidence = 0.5
+        # Set low max_disappeared so CentroidTracker removes object quickly
+        # Object removed after max_disappeared+1 empty frames
+        config.max_disappeared = 1
         tracker = TargetTracker(config, (1280, 720))
 
         det = [Detection(0, "person", 0.9, (600, 300, 700, 400), (650, 350))]
@@ -162,8 +168,11 @@ class TestTargetTracker:
         tracker.update(det)
         assert tracker.state == TrackingState.LOCKED
 
-        # Lose target
-        for _ in range(4):
+        # Lose target - needs enough frames for both:
+        # 1. CentroidTracker to remove object (max_disappeared=1, so 2 frames to remove)
+        # 2. TargetTracker to transition to LOST (frames_to_unlock=3 more frames)
+        # Total: 2 + 3 = 5 empty frames needed
+        for _ in range(5):
             tracker.update([])
 
         assert tracker.state == TrackingState.LOST

@@ -95,6 +95,7 @@ class ObjectDetector:
         self._model = None
         self._class_names: List[str] = []
         self._target_class_ids: set = set()
+        self._target_class_ids_array: Optional[np.ndarray] = None  # Pre-converted for vectorized ops
         self._inference_time = 0.0
         self._initialized = False
         self._consecutive_errors = 0
@@ -205,7 +206,7 @@ class ObjectDetector:
             if isinstance(self._class_names, dict):
                 self._class_names = list(self._class_names.values())
 
-            # Build target class ID set
+            # Build target class ID set and pre-convert to numpy array
             if self.config.target_classes:
                 for i, name in enumerate(self._class_names):
                     if name in self.config.target_classes:
@@ -217,6 +218,9 @@ class ObjectDetector:
             else:
                 # Detect all classes
                 self._target_class_ids = set(range(len(self._class_names)))
+
+            # Pre-convert to numpy array for vectorized filtering
+            self._target_class_ids_array = np.array(list(self._target_class_ids), dtype=np.int32)
 
             # Warm up model with dummy inference
             logger.info("Warming up model...")
@@ -260,11 +264,6 @@ class ObjectDetector:
             logger.warning("Detector not initialized")
             return []
 
-        # DEBUG: Log frame info first time
-        if not hasattr(self, '_frame_logged'):
-            logger.info(f"[DETECTOR] Frame: shape={frame.shape}, dtype={frame.dtype}, size={frame.nbytes/1024/1024:.1f}MB, contiguous={frame.flags['C_CONTIGUOUS']}")
-            self._frame_logged = True
-
         start_time = time.perf_counter()
 
         # ROI optimization: if provided, only process cropped region
@@ -303,11 +302,12 @@ class ObjectDetector:
                 confs = result.boxes.conf.cpu().numpy()
                 class_ids = result.boxes.cls.cpu().numpy().astype(int)
 
-                # Vectorized filtering by target classes
-                mask = np.isin(class_ids, list(self._target_class_ids))
-                boxes = boxes[mask]
-                confs = confs[mask]
-                class_ids = class_ids[mask]
+                # Vectorized filtering by target classes (using pre-converted array)
+                if self._target_class_ids_array is not None and len(self._target_class_ids_array) > 0:
+                    mask = np.isin(class_ids, self._target_class_ids_array)
+                    boxes = boxes[mask]
+                    confs = confs[mask]
+                    class_ids = class_ids[mask]
 
                 # Apply ROI offset if needed (vectorized)
                 if roi_offset != (0, 0):
@@ -320,9 +320,16 @@ class ObjectDetector:
                     cx = (x1 + x2) // 2
                     cy = (y1 + y2) // 2
 
+                    # Safe class name lookup with bounds check
+                    class_id_int = int(class_id)
+                    if 0 <= class_id_int < len(self._class_names):
+                        class_name = self._class_names[class_id_int]
+                    else:
+                        class_name = "unknown"
+
                     detections.append(Detection(
-                        class_id=int(class_id),
-                        class_name=self._class_names[class_id],
+                        class_id=class_id_int,
+                        class_name=class_name,
                         confidence=float(conf),
                         bbox=(x1, y1, x2, y2),
                         center=(cx, cy),
