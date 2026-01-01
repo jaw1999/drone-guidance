@@ -418,11 +418,11 @@ CONFIG_PAGE = """
         }
         .collapsible.collapsed::after { transform: rotate(-45deg); }
         .collapse-content {
-            max-height: 500px;
-            overflow: hidden;
+            max-height: 400px;
+            overflow-y: auto;
             transition: max-height 0.3s ease-out;
         }
-        .collapse-content.collapsed { max-height: 0; }
+        .collapse-content.collapsed { max-height: 0; overflow: hidden; }
 
         .class-grid {
             display: grid;
@@ -528,8 +528,22 @@ CONFIG_PAGE = """
 
     <div id="tab-tracking" class="tab-content active">
         <div class="card">
-            <div class="card-header">Detection</div>
+            <div class="card-header">Detection Model</div>
             <div class="card-body">
+                <div class="form-row">
+                    <span class="form-label">Model</span>
+                    <select class="form-input wide" id="det-model">
+                        <option value="yolov8n">YOLOv8n (6.2 MB)</option>
+                        <option value="yolo11n">YOLO11n (5.4 MB)</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <span class="form-label">Backend</span>
+                    <select class="form-input wide" id="det-backend">
+                        <option value="ncnn">NCNN (ARM optimized)</option>
+                        <option value="pytorch">PyTorch (CPU)</option>
+                    </select>
+                </div>
                 <div class="form-row">
                     <span class="form-label">Confidence</span>
                     <input type="number" step="0.05" min="0.1" max="1.0" class="form-input" id="det-conf">
@@ -541,6 +555,10 @@ CONFIG_PAGE = """
                 <div class="form-row">
                     <span class="form-label">Input Size</span>
                     <input type="number" step="32" min="160" max="640" class="form-input" id="det-size">
+                </div>
+                <div class="btn-row" style="margin-top: 14px;">
+                    <button class="btn btn-primary" onclick="switchModel()">Apply Model Change</button>
+                    <span id="model-status" style="font-size: 12px; color: var(--text-dim); margin-left: 10px;"></span>
                 </div>
             </div>
         </div>
@@ -567,6 +585,7 @@ CONFIG_PAGE = """
                 <div class="form-row">
                     <span class="form-label">Algorithm</span>
                     <select class="form-input wide" id="tracker-algorithm">
+                        <option value="nanotrack">NanoTrack (Siamese)</option>
                         <option value="bytetrack">ByteTrack (Kalman)</option>
                         <option value="centroid">Centroid (Simple)</option>
                     </select>
@@ -955,6 +974,9 @@ CONFIG_PAGE = """
                 setVal('tracker-lock-frames', config.tracker?.lock_on?.frames_to_lock);
                 setVal('tracker-unlock-frames', config.tracker?.lock_on?.frames_to_unlock);
 
+                // Detection model settings
+                document.getElementById('det-model').value = config.detector?.model || 'yolov8n';
+                document.getElementById('det-backend').value = config.detector?.backend || 'ncnn';
                 setVal('det-conf', config.detector?.confidence_threshold);
                 setVal('det-interval', config.detector?.detection_interval);
                 setVal('det-size', config.detector?.input_size);
@@ -1011,6 +1033,8 @@ CONFIG_PAGE = """
                     },
                 },
                 detector: {
+                    model: document.getElementById('det-model').value,
+                    backend: document.getElementById('det-backend').value,
                     confidence_threshold: getVal('det-conf'),
                     detection_interval: getVal('det-interval'),
                     input_size: getVal('det-size'),
@@ -1077,6 +1101,38 @@ CONFIG_PAGE = """
                 toast(d.status === 'ok' ? `${service} restarted` : (d.message || 'Failed'), d.status !== 'ok');
                 loadServiceStatus();
             } catch (e) { toast('Failed: ' + e, true); }
+        }
+
+        async function switchModel() {
+            const model = document.getElementById('det-model').value;
+            const backend = document.getElementById('det-backend').value;
+            const statusEl = document.getElementById('model-status');
+
+            statusEl.textContent = 'Switching model...';
+            statusEl.style.color = 'var(--warning)';
+
+            try {
+                const r = await fetch('/api/detector/switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model, backend })
+                });
+                const d = await r.json();
+
+                if (d.status === 'ok') {
+                    statusEl.textContent = `Loaded: ${model} (${backend})`;
+                    statusEl.style.color = 'var(--success)';
+                    toast(`Switched to ${model} with ${backend} backend`);
+                } else {
+                    statusEl.textContent = d.message || 'Failed';
+                    statusEl.style.color = 'var(--danger)';
+                    toast(d.message || 'Failed to switch model', true);
+                }
+            } catch (e) {
+                statusEl.textContent = 'Error: ' + e;
+                statusEl.style.color = 'var(--danger)';
+                toast('Failed: ' + e, true);
+            }
         }
 
         async function loadServiceStatus() {
@@ -1280,6 +1336,52 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
                 "running": guidance._mavlink is not None and guidance._mavlink.is_connected,
             },
         })
+
+    @app.route("/api/detector/switch", methods=["POST"])
+    def switch_detector() -> Tuple[Response, int]:
+        """Switch the detection model."""
+        try:
+            data = request.get_json()
+        except Exception:
+            return api_response(False, message="Invalid JSON", status=400)
+
+        if not data:
+            return api_response(False, message="No data provided", status=400)
+
+        model = data.get("model", "yolov8n")
+        backend = data.get("backend", "ncnn")
+
+        # Validate model name
+        valid_models = {"yolov8n", "yolov8s", "yolo11n", "yolo11s"}
+        if model not in valid_models:
+            return api_response(False, message=f"Invalid model: {model}", status=400)
+
+        # Validate backend
+        valid_backends = {"ncnn", "pytorch", "openvino"}
+        if backend not in valid_backends:
+            return api_response(False, message=f"Invalid backend: {backend}", status=400)
+
+        try:
+            # Update config
+            guidance.config["detector"]["model"] = model
+            guidance.config["detector"]["backend"] = backend
+
+            # Set weights path based on model and backend
+            if backend == "ncnn":
+                guidance.config["detector"]["weights_path"] = f"{model}_ncnn_model"
+            else:
+                guidance.config["detector"]["weights_path"] = f"{model}.pt"
+
+            # Restart detector with new model
+            guidance.restart_detector()
+
+            return api_response(True, {
+                "model": model,
+                "backend": backend,
+            }, message=f"Switched to {model} ({backend})")
+        except Exception as e:
+            logger.error(f"Failed to switch model: {e}")
+            return api_response(False, message=str(e), status=500)
 
     @app.route("/api/restart/<service>", methods=["POST"])
     def restart_service(service: str) -> Tuple[Response, int]:

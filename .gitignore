@@ -21,8 +21,6 @@ build/
 logs/*.log
 !logs/.gitkeep
 config/local.yaml
-*.pt
-*.onnx
 
 # OS
 .DS_Store

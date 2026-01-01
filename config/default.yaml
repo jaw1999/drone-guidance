@@ -39,17 +39,17 @@ camera:
 #   2. Set backend: "tflite" below
 #
 detector:
-  # Model selection: yolo11n (recommended), yolo11s, yolov8n, yolov8s
-  # YOLO11n is fastest on ARM, best accuracy/speed tradeoff
-  model: "yolo11n"
+  # Model selection: yolov8n (recommended), yolov8s, yolo11n, yolo11s
+  # YOLOv8n has more stable NCNN export on ARM
+  model: "yolov8n"
 
   # Backend: "ncnn" (default), "openvino", "pytorch"
   backend: "ncnn"
 
   # Path to custom model weights (optional, uses default if empty)
-  # For NCNN: "yolo11n_ncnn_model"
-  # For TFLite: "yolo11n_int8.tflite"
-  weights_path: "yolo11n_ncnn_model"
+  # For NCNN: "yolov8n_ncnn_model"
+  # For TFLite: "yolov8n_int8.tflite"
+  weights_path: "yolov8n_ncnn_model"
 
   # Auto-export to NCNN format on first run (~4x faster on ARM)
   auto_export_ncnn: false
@@ -95,13 +95,22 @@ detector:
 
 # Target Tracking Configuration
 tracker:
-  # Tracking algorithm: "centroid" (simple, fast) or "bytetrack" (Kalman, better occlusion handling)
-  algorithm: "bytetrack"
+  # Tracking algorithm:
+  #   "nanotrack" - Siamese network tracker, best for maintaining lock (RECOMMENDED)
+  #   "bytetrack" - Kalman + IoU matching, handles multiple objects
+  #   "centroid"  - Simple centroid-based, fast but less robust
+  #
+  # NanoTrack advantages:
+  #   - 30-60+ FPS on RPi5 (very fast)
+  #   - Maintains lock through appearance changes
+  #   - Target-agnostic (tracks whatever you initialize on)
+  #   - Only 1.8MB models
+  algorithm: "nanotrack"
 
   # Max frames to keep tracking without detection
   max_disappeared: 30
 
-  # Distance threshold for object association (pixels, used by centroid tracker)
+  # Distance threshold for object association (pixels, used by centroid/bytetrack)
   max_distance: 150
 
   # Lock-on settings
@@ -118,6 +127,11 @@ tracker:
     high_thresh: 0.5   # High confidence threshold for first association pass
     low_thresh: 0.1    # Low confidence threshold for second pass (catches occluded objects)
     match_thresh: 0.8  # IoU threshold for track-detection matching
+
+  # NanoTrack model paths (optional, uses defaults if not specified)
+  # nanotrack:
+  #   backbone: "models/nanotrack_backbone.onnx"
+  #   head: "models/nanotrack_head.onnx"
 
 # PID Controller Configuration
 pid:

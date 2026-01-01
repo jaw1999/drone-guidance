@@ -347,7 +347,7 @@ class Pipeline:
         )
 
         # Check for completed detection results
-        self._collect_detection_results()
+        had_detection_results = self._collect_detection_results(frame=frame)
 
         # Decide if we should run detection this frame
         frames_since_detect = self._frame_count - self._last_detection_frame
@@ -360,21 +360,31 @@ class Pipeline:
             ):
                 self._last_detection_frame = self._frame_count
 
-        # Always use interpolated positions for smooth motion
-        # This prevents "snapping" when new detections arrive
-        predicted = self._interpolator.interpolate(now)
-        if predicted:
-            frame_data.tracked_objects = predicted
-            # Get interpolated locked target position
-            locked = self.tracker.locked_target
-            if locked and locked.object_id in predicted:
-                frame_data.locked_target = predicted[locked.object_id]
-            else:
-                frame_data.locked_target = locked
-        else:
-            # No predictions yet, use raw tracker data
+        # For NanoTrack: update tracker every frame for continuous tracking
+        # NanoTrack needs the frame on every update, not just when detections arrive
+        uses_nanotrack = hasattr(self.tracker, '_uses_nanotrack') and self.tracker._uses_nanotrack
+        if uses_nanotrack:
+            # Only update if we didn't already update with detection results this frame
+            if not had_detection_results:
+                self.tracker.update([], frame=frame)
+            # Use fresh tracker data directly (NanoTrack updates position each frame)
             frame_data.tracked_objects = self.tracker.all_targets
             frame_data.locked_target = self.tracker.locked_target
+        else:
+            # For other trackers: use interpolated positions for smooth motion
+            predicted = self._interpolator.interpolate(now)
+            if predicted:
+                frame_data.tracked_objects = predicted
+                # Get interpolated locked target position
+                locked = self.tracker.locked_target
+                if locked and locked.object_id in predicted:
+                    frame_data.locked_target = predicted[locked.object_id]
+                else:
+                    frame_data.locked_target = locked
+            else:
+                # No predictions yet, use raw tracker data
+                frame_data.tracked_objects = self.tracker.all_targets
+                frame_data.locked_target = self.tracker.locked_target
 
         frame_data.tracking_state = self.tracker.state
         frame_data.detections = self._last_detections
@@ -390,11 +400,17 @@ class Pipeline:
 
         return frame_data
 
-    def _collect_detection_results(self) -> None:
+    def _collect_detection_results(self, frame: Optional[np.ndarray] = None) -> bool:
         """Check for and process ALL completed detection results.
 
         Drains the queue to prevent stale results from accumulating.
         Only the most recent result is used for tracker state.
+
+        Args:
+            frame: Current video frame (required for NanoTrack)
+
+        Returns:
+            True if detection results were processed, False otherwise
         """
         latest_result = None
 
@@ -407,13 +423,13 @@ class Pipeline:
                 break
 
         if latest_result is None:
-            return
+            return False
 
         # Unpack tuple: (detections, timestamp, inference_ms, frame_id)
         detections, timestamp, inference_ms, frame_id = latest_result
 
-        # Update tracker with new detections
-        self.tracker.update(detections)
+        # Update tracker with new detections (pass frame for NanoTrack)
+        self.tracker.update(detections, frame=frame)
         self._last_detections = detections
         self._inference_ms = inference_ms
 
@@ -422,3 +438,4 @@ class Pipeline:
             self.tracker.all_targets,
             timestamp,
         )
+        return True
