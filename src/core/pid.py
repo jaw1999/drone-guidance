@@ -71,7 +71,6 @@ class PIDAxis:
 
     Features:
     - Anti-windup via integral clamping
-    - Derivative-on-measurement to avoid setpoint kick
     - Low-pass filtering on derivative term
     - Slew rate limiting for smooth output
     """
@@ -84,7 +83,6 @@ class PIDAxis:
         # State
         self._integral = 0.0
         self._prev_error = 0.0
-        self._prev_measurement = 0.0
         self._prev_time: Optional[float] = None
         self._first_update = True
         self._filtered_derivative = 0.0
@@ -101,15 +99,13 @@ class PIDAxis:
             return min(max_output / ki, max_output * 100)
         return max_output * 100
 
-    def update(self, error: float, dt: Optional[float] = None,
-               measurement: float = 0.0) -> float:
+    def update(self, error: float, dt: Optional[float] = None) -> float:
         """
         Calculate PID output for given error.
 
         Args:
             error: Current error (normalized -1 to 1)
             dt: Time delta in seconds (auto-calculated if None)
-            measurement: Process variable for derivative-on-measurement
 
         Returns:
             Control output clamped to max_output
@@ -139,9 +135,6 @@ class PIDAxis:
         if self._first_update:
             raw_derivative = 0.0
             self._first_update = False
-        elif measurement != 0.0:
-            # Derivative on measurement (avoids setpoint kick)
-            raw_derivative = -(measurement - self._prev_measurement) / dt
         else:
             raw_derivative = (error - self._prev_error) / dt
 
@@ -153,7 +146,6 @@ class PIDAxis:
         d_term = self.gains.kd * self._filtered_derivative
 
         self._prev_error = error
-        self._prev_measurement = measurement
 
         # Sum and clamp
         output = p_term + i_term + d_term
@@ -173,7 +165,6 @@ class PIDAxis:
         """Reset controller state."""
         self._integral = 0.0
         self._prev_error = 0.0
-        self._prev_measurement = 0.0
         self._prev_time = None
         self._first_update = True
         self._filtered_derivative = 0.0
