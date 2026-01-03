@@ -1,16 +1,4 @@
-"""Flask configuration UI for Terminal Guidance.
-
-This module provides a lightweight web interface for configuring and
-monitoring the terminal guidance system. The UI is designed for minimal
-resource usage on Raspberry Pi 5.
-
-Video streaming is handled separately via UDP to QGroundControl.
-
-Functions:
-    api_response: Create standardized API response.
-    create_app: Create Flask application with all routes.
-    run_web_server: Run the Flask development server.
-"""
+"""Flask configuration UI for Terminal Guidance."""
 
 import logging
 import re
@@ -538,10 +526,11 @@ CONFIG_PAGE = """
                     </select>
                 </div>
                 <div class="form-row">
-                    <span class="form-label">Backend</span>
-                    <select class="form-input wide" id="det-backend">
-                        <option value="ncnn">NCNN (ARM optimized)</option>
-                        <option value="pytorch">PyTorch (CPU)</option>
+                    <span class="form-label">Resolution</span>
+                    <select class="form-input wide" id="det-resolution">
+                        <option value="640">640px (best range, ~90ms)</option>
+                        <option value="416">416px (balanced, ~44ms)</option>
+                        <option value="320">320px (fastest, ~35ms)</option>
                     </select>
                 </div>
                 <div class="form-row">
@@ -551,10 +540,6 @@ CONFIG_PAGE = """
                 <div class="form-row">
                     <span class="form-label">Interval (frames)</span>
                     <input type="number" step="1" min="1" max="10" class="form-input" id="det-interval">
-                </div>
-                <div class="form-row">
-                    <span class="form-label">Input Size</span>
-                    <input type="number" step="32" min="160" max="640" class="form-input" id="det-size">
                 </div>
                 <div class="btn-row" style="margin-top: 14px;">
                     <button class="btn btn-primary" onclick="switchModel()">Apply Model Change</button>
@@ -585,7 +570,6 @@ CONFIG_PAGE = """
                 <div class="form-row">
                     <span class="form-label">Algorithm</span>
                     <select class="form-input wide" id="tracker-algorithm">
-                        <option value="nanotrack">NanoTrack (Siamese)</option>
                         <option value="bytetrack">ByteTrack (Kalman)</option>
                         <option value="centroid">Centroid (Simple)</option>
                     </select>
@@ -976,10 +960,9 @@ CONFIG_PAGE = """
 
                 // Detection model settings
                 document.getElementById('det-model').value = config.detector?.model || 'yolov8n';
-                document.getElementById('det-backend').value = config.detector?.backend || 'ncnn';
+                document.getElementById('det-resolution').value = config.detector?.resolution || '640';
                 setVal('det-conf', config.detector?.confidence_threshold);
                 setVal('det-interval', config.detector?.detection_interval);
-                setVal('det-size', config.detector?.input_size);
 
                 document.getElementById('safety-lost-action').value = config.safety?.target_lost_action || 'loiter';
                 setVal('safety-timeout', config.safety?.search_timeout);
@@ -1034,10 +1017,9 @@ CONFIG_PAGE = """
                 },
                 detector: {
                     model: document.getElementById('det-model').value,
-                    backend: document.getElementById('det-backend').value,
+                    resolution: document.getElementById('det-resolution').value,
                     confidence_threshold: getVal('det-conf'),
                     detection_interval: getVal('det-interval'),
-                    input_size: getVal('det-size'),
                     target_classes: selectedClasses,
                 },
                 safety: {
@@ -1105,7 +1087,7 @@ CONFIG_PAGE = """
 
         async function switchModel() {
             const model = document.getElementById('det-model').value;
-            const backend = document.getElementById('det-backend').value;
+            const resolution = document.getElementById('det-resolution').value;
             const statusEl = document.getElementById('model-status');
 
             statusEl.textContent = 'Switching model...';
@@ -1115,14 +1097,14 @@ CONFIG_PAGE = """
                 const r = await fetch('/api/detector/switch', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model, backend })
+                    body: JSON.stringify({ model, resolution })
                 });
                 const d = await r.json();
 
                 if (d.status === 'ok') {
-                    statusEl.textContent = `Loaded: ${model} (${backend})`;
+                    statusEl.textContent = `Loaded: ${model} @ ${resolution}px`;
                     statusEl.style.color = 'var(--success)';
-                    toast(`Switched to ${model} with ${backend} backend`);
+                    toast(`Switched to ${model} @ ${resolution}px`);
                 } else {
                     statusEl.textContent = d.message || 'Failed';
                     statusEl.style.color = 'var(--danger)';
@@ -1168,17 +1150,7 @@ def api_response(
     message: str = None,
     status: int = 200
 ) -> Tuple[Response, int]:
-    """Create standardized API response.
-
-    Args:
-        success: Whether the operation succeeded.
-        data: Optional response data (dict or other).
-        message: Optional message string.
-        status: HTTP status code.
-
-    Returns:
-        Tuple of (Response, status_code) for Flask.
-    """
+    """Create standardized API response."""
     response = {"status": "ok" if success else "error"}
     if data is not None:
         if isinstance(data, dict):
@@ -1191,14 +1163,7 @@ def api_response(
 
 
 def create_app(guidance: "TerminalGuidance") -> Flask:
-    """Create Flask application with API routes.
-
-    Args:
-        guidance: The TerminalGuidance instance to control.
-
-    Returns:
-        Configured Flask application.
-    """
+    """Create Flask application with API routes."""
     app = Flask(__name__)
     app.guidance = guidance
 
@@ -1339,7 +1304,7 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
 
     @app.route("/api/detector/switch", methods=["POST"])
     def switch_detector() -> Tuple[Response, int]:
-        """Switch the detection model."""
+        """Switch the detection model and/or resolution."""
         try:
             data = request.get_json()
         except Exception:
@@ -1349,36 +1314,30 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
             return api_response(False, message="No data provided", status=400)
 
         model = data.get("model", "yolov8n")
-        backend = data.get("backend", "ncnn")
+        resolution = data.get("resolution", "640")
 
         # Validate model name
-        valid_models = {"yolov8n", "yolov8s", "yolo11n", "yolo11s"}
+        valid_models = {"yolov8n", "yolo11n"}
         if model not in valid_models:
             return api_response(False, message=f"Invalid model: {model}", status=400)
 
-        # Validate backend
-        valid_backends = {"ncnn", "pytorch", "openvino"}
-        if backend not in valid_backends:
-            return api_response(False, message=f"Invalid backend: {backend}", status=400)
+        # Validate resolution
+        valid_resolutions = {"640", "416", "320"}
+        if resolution not in valid_resolutions:
+            return api_response(False, message=f"Invalid resolution: {resolution}", status=400)
 
         try:
             # Update config
             guidance.config["detector"]["model"] = model
-            guidance.config["detector"]["backend"] = backend
-
-            # Set weights path based on model and backend
-            if backend == "ncnn":
-                guidance.config["detector"]["weights_path"] = f"{model}_ncnn_model"
-            else:
-                guidance.config["detector"]["weights_path"] = f"{model}.pt"
+            guidance.config["detector"]["resolution"] = resolution
 
             # Restart detector with new model
             guidance.restart_detector()
 
             return api_response(True, {
                 "model": model,
-                "backend": backend,
-            }, message=f"Switched to {model} ({backend})")
+                "resolution": resolution,
+            }, message=f"Switched to {model} @ {resolution}px")
         except Exception as e:
             logger.error(f"Failed to switch model: {e}")
             return api_response(False, message=str(e), status=500)
@@ -1409,14 +1368,7 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
 
     @app.route("/api/health")
     def health_check() -> Response:
-        """Health check endpoint for monitoring and load balancers.
-
-        Returns system health metrics including:
-        - CPU usage and temperature
-        - Memory usage
-        - Disk usage
-        - Component status (detector, MAVLink, tracking)
-        """
+        """Health check endpoint with system metrics."""
         try:
             # System metrics
             cpu_percent = psutil.cpu_percent(interval=0.1)
@@ -1473,11 +1425,5 @@ def create_app(guidance: "TerminalGuidance") -> Flask:
 
 
 def run_web_server(app: Flask, host: str = "0.0.0.0", port: int = 5000) -> None:
-    """Run the Flask development server.
-
-    Args:
-        app: Flask application instance.
-        host: Host address to bind to.
-        port: Port number to listen on.
-    """
+    """Run the Flask development server."""
     app.run(host=host, port=port, threaded=True, use_reloader=False)

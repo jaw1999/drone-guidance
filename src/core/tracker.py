@@ -3,24 +3,15 @@
 import logging
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from .detector import Detection
 
 logger = logging.getLogger(__name__)
-
-# Default paths for NanoTrack models
-# NOTE: Must use the official OpenCV-compatible models from SiamTrackers repo
-# https://github.com/HonglinChu/SiamTrackers/tree/master/NanoTrack/models/nanotrackv2
-MODELS_DIR = Path(__file__).parent.parent.parent / "models"
-DEFAULT_NANOTRACK_BACKBONE = MODELS_DIR / "nanotrack_backbone_sim.onnx"
-DEFAULT_NANOTRACK_HEAD = MODELS_DIR / "nanotrack_head_sim.onnx"
 
 # Tracking constants
 MIN_VELOCITY_DT = 0.01  # Minimum time delta for velocity calculation (seconds)
@@ -142,10 +133,6 @@ class CentroidTracker:
             object_ids = tuple(self._objects.keys())  # tuple is lighter than list
 
             # Vectorized distance calculation using NumPy broadcasting
-            # Use squared distances to avoid sqrt
-            n_obj = len(object_ids)
-            n_det = len(detections)
-
             # Build center arrays for vectorized computation
             obj_centers = np.array([self._objects[oid].center for oid in object_ids], dtype=np.float32)
             det_centers = np.array([det.center for det in detections], dtype=np.float32)
@@ -260,12 +247,7 @@ class CentroidTracker:
 # =============================================================================
 
 class KalmanFilter:
-    """
-    Simple Kalman filter for bounding box tracking.
-
-    State vector: [cx, cy, aspect_ratio, height, vx, vy, va, vh]
-    Measurement: [cx, cy, aspect_ratio, height]
-    """
+    """Kalman filter for bounding box tracking."""
 
     def __init__(self):
         # State transition matrix (constant velocity model)
@@ -484,14 +466,7 @@ class STrack:
 
 
 class ByteTracker:
-    """
-    ByteTrack multi-object tracker.
-
-    Key features:
-    - Two-stage association: high confidence first, then low confidence
-    - Kalman filter for motion prediction
-    - Handles occlusions and ID switches better than centroid tracking
-    """
+    """ByteTrack multi-object tracker with Kalman filtering."""
 
     def __init__(
         self,
@@ -514,8 +489,15 @@ class ByteTracker:
 
     @property
     def objects(self) -> Dict[int, TrackedObject]:
-        """Get all active tracked objects (compatible with CentroidTracker interface)."""
+        """Get all tracked objects including recently lost ones.
+
+        Returns both actively tracked and recently lost objects.
+        Lost objects use Kalman-predicted positions to maintain visual continuity.
+        """
         result = {}
+        current_time = time.time()
+
+        # Add actively tracked objects
         for track in self._tracked_stracks:
             if track.is_activated:
                 result[track.track_id] = TrackedObject(
@@ -527,8 +509,29 @@ class ByteTracker:
                     frames_visible=track.tracklet_len,
                     frames_missing=0,
                     velocity=self._estimate_velocity(track),
-                    last_update=time.time(),
+                    last_update=current_time,
                 )
+
+        # Add recently lost objects with predicted positions (prevents flickering)
+        for track in self._lost_stracks:
+            if track.track_id not in result:
+                frames_lost = self._frame_id - track.frame_id
+                # Use predicted bbox from Kalman filter for smoother tracking
+                predicted_bbox = track.predicted_bbox
+                cx = (predicted_bbox[0] + predicted_bbox[2]) // 2
+                cy = (predicted_bbox[1] + predicted_bbox[3]) // 2
+                result[track.track_id] = TrackedObject(
+                    object_id=track.track_id,
+                    class_name=track.class_name,
+                    center=(cx, cy),
+                    bbox=predicted_bbox,
+                    confidence=track.score * 0.8,  # Reduce confidence for lost tracks
+                    frames_visible=track.tracklet_len,
+                    frames_missing=frames_lost,
+                    velocity=self._estimate_velocity(track),
+                    last_update=current_time,
+                )
+
         return result
 
     def _estimate_velocity(self, track: STrack) -> Tuple[float, float]:
@@ -548,8 +551,7 @@ class ByteTracker:
         for track in self._lost_stracks:
             track.predict()
 
-        # Split detections by confidence and create STracks in single pass
-        # This avoids 4 separate list comprehensions (2 filters + 2 STrack creates)
+        # Split detections by confidence
         high_dets = []
         low_dets = []
         high_stracks = []
@@ -727,275 +729,8 @@ class ByteTracker:
         STrack.reset_id()
 
 
-# =============================================================================
-# NanoTrack Implementation (Siamese Network Tracker)
-# =============================================================================
-
-class NanoTracker:
-    """
-    NanoTrack-based visual object tracker using OpenCV's TrackerNano.
-
-    NanoTrack is a Siamese network tracker that excels at maintaining lock
-    on a specific target instance. Unlike detection-based trackers, it learns
-    a template of the target and matches it frame-to-frame.
-
-    Key advantages:
-    - Very fast (30-60+ FPS on RPi5)
-    - Maintains lock through appearance changes, partial occlusions
-    - Target-agnostic (tracks whatever you initialize it with)
-    - Lightweight (~1.8MB models)
-
-    Use with YOLO: YOLO detects targets, NanoTrack maintains continuous lock.
-    """
-
-    def __init__(
-        self,
-        backbone_path: Optional[Path] = None,
-        head_path: Optional[Path] = None,
-        max_disappeared: int = 30,
-        max_distance: int = 100,
-    ):
-        self.max_disappeared = max_disappeared
-        self.max_distance = max_distance
-
-        # Model paths
-        self._backbone_path = backbone_path or DEFAULT_NANOTRACK_BACKBONE
-        self._head_path = head_path or DEFAULT_NANOTRACK_HEAD
-
-        # Validate models exist
-        if not self._backbone_path.exists():
-            raise FileNotFoundError(f"NanoTrack backbone not found: {self._backbone_path}")
-        if not self._head_path.exists():
-            raise FileNotFoundError(f"NanoTrack head not found: {self._head_path}")
-
-        # Tracker state
-        self._cv_tracker: Optional[cv2.TrackerNano] = None
-        self._is_initialized = False
-        self._track_id = 0
-        self._next_id = 1
-
-        # Current tracked object state
-        self._bbox: Optional[Tuple[int, int, int, int]] = None
-        self._class_name: str = "target"
-        self._confidence: float = 1.0
-        self._frames_visible: int = 0
-        self._frames_missing: int = 0
-        self._velocity: Tuple[float, float] = (0.0, 0.0)
-        self._last_center: Optional[Tuple[int, int]] = None
-        self._last_update: float = 0.0
-
-        # Frame reference for tracking
-        self._last_frame: Optional[np.ndarray] = None
-
-        logger.info(f"NanoTracker initialized with models: {self._backbone_path.name}, {self._head_path.name}")
-
-    def _create_tracker(self) -> cv2.TrackerNano:
-        """Create a new TrackerNano instance."""
-        params = cv2.TrackerNano.Params()
-        params.backbone = str(self._backbone_path)
-        params.neckhead = str(self._head_path)
-        return cv2.TrackerNano.create(params)
-
-    def init(self, frame: np.ndarray, bbox: Tuple[int, int, int, int], class_name: str = "target") -> bool:
-        """
-        Initialize tracker with a target bounding box.
-
-        Args:
-            frame: Current video frame (BGR)
-            bbox: Target bounding box (x1, y1, x2, y2)
-            class_name: Class name for the target
-
-        Returns:
-            True if initialization successful
-        """
-        # Convert x1,y1,x2,y2 to x,y,w,h for OpenCV
-        x1, y1, x2, y2 = bbox
-        cv_bbox = (x1, y1, x2 - x1, y2 - y1)
-
-        # Create fresh tracker
-        self._cv_tracker = self._create_tracker()
-
-        try:
-            logger.debug(f"NanoTrack init: frame {frame.shape}, bbox {cv_bbox}")
-            result = self._cv_tracker.init(frame, cv_bbox)
-            # NOTE: OpenCV TrackerNano.init() returns None on some builds instead of True
-            # We treat None as success since the tracker actually works
-            success = result is None or result is True
-            if success:
-                self._is_initialized = True
-                self._track_id = self._next_id
-                self._next_id += 1
-                self._bbox = bbox
-                self._class_name = class_name
-                self._confidence = 1.0
-                self._frames_visible = 1
-                self._frames_missing = 0
-                self._last_center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                self._last_update = time.time()
-                self._last_frame = frame.copy()
-                logger.info(f"NanoTrack initialized on target ID {self._track_id}: {class_name}")
-                return True
-            else:
-                logger.warning(f"TrackerNano.init failed with result: {result}")
-        except Exception as e:
-            logger.error(f"NanoTrack init failed: {e}", exc_info=True)
-
-        self._is_initialized = False
-        return False
-
-    def update_frame(self, frame: np.ndarray) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
-        """
-        Update tracker with new frame.
-
-        Args:
-            frame: Current video frame (BGR)
-
-        Returns:
-            (success, bbox) where bbox is (x1, y1, x2, y2) or None
-        """
-        if not self._is_initialized or self._cv_tracker is None:
-            return False, None
-
-        self._last_frame = frame
-
-        try:
-            success, cv_bbox = self._cv_tracker.update(frame)
-
-            if success:
-                # Convert x,y,w,h back to x1,y1,x2,y2
-                x, y, w, h = [int(v) for v in cv_bbox]
-                bbox = (x, y, x + w, y + h)
-
-                # Calculate velocity
-                current_time = time.time()
-                new_center = (x + w // 2, y + h // 2)
-
-                if self._last_center is not None:
-                    dt = current_time - self._last_update
-                    if MIN_VELOCITY_DT < dt < MAX_VELOCITY_DT:
-                        raw_vx = (new_center[0] - self._last_center[0]) / dt
-                        raw_vy = (new_center[1] - self._last_center[1]) / dt
-                        alpha = VELOCITY_SMOOTHING_ALPHA
-                        old_vx, old_vy = self._velocity
-                        self._velocity = (
-                            alpha * raw_vx + (1 - alpha) * old_vx,
-                            alpha * raw_vy + (1 - alpha) * old_vy,
-                        )
-
-                self._bbox = bbox
-                self._last_center = new_center
-                self._last_update = current_time
-                self._frames_visible += 1
-                self._frames_missing = 0
-                self._confidence = 1.0  # NanoTrack doesn't provide confidence, assume good
-
-                return True, bbox
-            else:
-                self._frames_missing += 1
-                self._confidence *= 0.9  # Decay confidence on miss
-
-                if self._frames_missing > self.max_disappeared:
-                    logger.warning(f"NanoTrack lost target after {self._frames_missing} frames")
-                    self._is_initialized = False
-
-                return False, self._bbox  # Return last known bbox
-
-        except Exception as e:
-            logger.error(f"NanoTrack update failed: {e}")
-            self._frames_missing += 1
-            return False, self._bbox
-
-    def update(self, detections: List[Detection], frame: Optional[np.ndarray] = None) -> Dict[int, TrackedObject]:
-        """
-        Update tracker - compatible interface with CentroidTracker/ByteTracker.
-
-        For NanoTrack, detections are used to (re)initialize if not tracking.
-        The frame parameter is required for NanoTrack to work.
-
-        Args:
-            detections: List of Detection objects (used for initialization)
-            frame: Current video frame (required for NanoTrack)
-
-        Returns:
-            Dictionary of object_id -> TrackedObject
-        """
-        if frame is None:
-            frame = self._last_frame
-
-        if frame is None:
-            return {}
-
-        # If not initialized and we have detections, initialize on best detection
-        if not self._is_initialized and detections:
-            # Pick highest confidence detection
-            best = max(detections, key=lambda d: d.confidence)
-            self.init(frame, best.bbox, best.class_name)
-
-        # Update with current frame
-        success, bbox = self.update_frame(frame)
-
-        if success and bbox is not None:
-            return {
-                self._track_id: TrackedObject(
-                    object_id=self._track_id,
-                    class_name=self._class_name,
-                    center=self._last_center or ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2),
-                    bbox=bbox,
-                    confidence=self._confidence,
-                    frames_visible=self._frames_visible,
-                    frames_missing=self._frames_missing,
-                    velocity=self._velocity,
-                    last_update=self._last_update,
-                )
-            }
-
-        return {}
-
-    @property
-    def objects(self) -> Dict[int, TrackedObject]:
-        """Get all tracked objects (single object for NanoTrack)."""
-        if not self._is_initialized or self._bbox is None:
-            return {}
-
-        return {
-            self._track_id: TrackedObject(
-                object_id=self._track_id,
-                class_name=self._class_name,
-                center=self._last_center or ((self._bbox[0] + self._bbox[2]) // 2, (self._bbox[1] + self._bbox[3]) // 2),
-                bbox=self._bbox,
-                confidence=self._confidence,
-                frames_visible=self._frames_visible,
-                frames_missing=self._frames_missing,
-                velocity=self._velocity,
-                last_update=self._last_update,
-            )
-        }
-
-    @property
-    def is_tracking(self) -> bool:
-        """Check if currently tracking a target."""
-        return self._is_initialized and self._frames_missing == 0
-
-    def reset(self) -> None:
-        """Reset tracker state."""
-        self._cv_tracker = None
-        self._is_initialized = False
-        self._bbox = None
-        self._frames_visible = 0
-        self._frames_missing = 0
-        self._velocity = (0.0, 0.0)
-        self._last_center = None
-        self._last_frame = None
-        logger.info("NanoTracker reset")
-
-
 class TargetTracker:
-    """
-    High-level target tracker with lock-on capability.
-
-    Manages target selection, lock-on state, and provides
-    error signals for the PID controller.
-    """
+    """High-level target tracker with lock-on capability."""
 
     def __init__(self, config: TrackerConfig, frame_size: Tuple[int, int]):
         self.config = config
@@ -1007,14 +742,7 @@ class TargetTracker:
         # Initialize tracker based on algorithm selection
         algorithm = config.algorithm.lower()
 
-        if algorithm == "nanotrack":
-            logger.info("Using NanoTrack algorithm (Siamese network tracker)")
-            self._tracker = NanoTracker(
-                max_disappeared=config.max_disappeared,
-                max_distance=config.max_distance,
-            )
-            self._uses_nanotrack = True
-        elif algorithm == "bytetrack":
+        if algorithm == "bytetrack":
             logger.info("Using ByteTrack algorithm (Kalman + IoU matching)")
             self._tracker = ByteTracker(
                 max_disappeared=config.max_disappeared,
@@ -1023,17 +751,12 @@ class TargetTracker:
                 low_thresh=config.low_thresh,
                 match_thresh=config.match_thresh,
             )
-            self._uses_nanotrack = False
         else:
             logger.info("Using Centroid tracker algorithm")
             self._tracker = CentroidTracker(
                 max_disappeared=config.max_disappeared,
                 max_distance=config.max_distance,
             )
-            self._uses_nanotrack = False
-
-        # Store last frame for NanoTrack
-        self._last_frame: Optional[np.ndarray] = None
 
         # Lock-on state
         self._state = TrackingState.SEARCHING
@@ -1080,20 +803,13 @@ class TargetTracker:
 
         Args:
             detections: List of detections from detector
-            frame: Current video frame (required for NanoTrack)
+            frame: Unused, kept for API compatibility
 
         Returns:
             Locked target if tracking, None otherwise
         """
-        # Store frame for NanoTrack
-        if frame is not None:
-            self._last_frame = frame
-
         # Update object tracker
-        if self._uses_nanotrack:
-            objects = self._tracker.update(detections, frame=self._last_frame)
-        else:
-            objects = self._tracker.update(detections)
+        objects = self._tracker.update(detections)
 
         # State machine
         if self._state == TrackingState.SEARCHING:
@@ -1136,53 +852,29 @@ class TargetTracker:
         class_name: str = "target",
     ) -> bool:
         """
-        Initialize tracking on a specific bounding box (for NanoTrack).
-
-        This is the preferred way to start tracking with NanoTrack - provide
-        the exact bbox you want to track.
+        Initialize tracking on a specific bounding box.
 
         Args:
             bbox: Target bounding box (x1, y1, x2, y2)
-            frame: Video frame containing the target
+            frame: Unused, kept for API compatibility
             class_name: Class name for the target
 
         Returns:
             True if lock successful
         """
-        if frame is None:
-            frame = self._last_frame
-
-        if frame is None:
-            logger.error("Cannot lock on bbox: no frame available")
-            return False
-
-        if self._uses_nanotrack:
-            # Initialize NanoTrack directly on the bbox
-            success = self._tracker.init(frame, bbox, class_name)
-            if success:
-                self._locked_target_id = self._tracker._track_id
-                self._state = TrackingState.LOCKED
-                self._lost_frames = 0
-                # Save target info from the tracker
-                if self._tracker.objects:
-                    target = list(self._tracker.objects.values())[0]
-                    self._save_target_info(target)
-                logger.info(f"NanoTrack locked on bbox: {bbox}")
-                return True
-        else:
-            # For other trackers, create a detection and update
-            from .detector import Detection
-            det = Detection(
-                class_id=0,
-                class_name=class_name,
-                confidence=1.0,
-                bbox=bbox,
-                center=((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2),
-            )
-            objects = self._tracker.update([det])
-            if objects:
-                target_id = list(objects.keys())[0]
-                return self.lock_target(target_id)
+        # Create a detection and update the tracker
+        from .detector import Detection
+        det = Detection(
+            class_id=0,
+            class_name=class_name,
+            confidence=1.0,
+            bbox=bbox,
+            center=((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2),
+        )
+        objects = self._tracker.update([det])
+        if objects:
+            target_id = list(objects.keys())[0]
+            return self.lock_target(target_id)
 
         return False
 
@@ -1267,8 +959,7 @@ class TargetTracker:
                 self._save_target_info(candidate)
                 logger.info(f"Target {self._locked_target_id} locked")
         else:
-            # Confidence dropped - reduce lock frames but don't reset completely
-            # This provides hysteresis to handle fluctuating confidence
+            # Confidence dropped, decay lock frames (hysteresis)
             self._lock_frames = max(0, self._lock_frames - 2)
             if self._lock_frames == 0:
                 self._lock_candidate_id = None

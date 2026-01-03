@@ -1,15 +1,4 @@
-"""Video streamer with overlay rendering using FFmpeg to UDP.
-
-This module provides video streaming capabilities for the terminal guidance
-system, including overlay rendering for tracking visualization and FFmpeg-based
-H.264 encoding for UDP streaming to QGroundControl.
-
-Classes:
-    OverlayConfig: Configuration for overlay rendering.
-    StreamerConfig: Configuration for the UDP streamer.
-    OverlayRenderer: Renders tracking overlays on video frames.
-    UDPStreamer: Streams H.264 video over UDP using FFmpeg.
-"""
+"""H.264 UDP streamer with tracking overlay for QGC."""
 
 import logging
 import re
@@ -123,11 +112,7 @@ class StreamerConfig:
 
 
 class OverlayRenderer:
-    """
-    Renders tracking overlay on frames.
-
-    Optimized for Pi 5: caches text sizes, uses simple drawing primitives.
-    """
+    """Renders tracking overlay on frames."""
 
     # Colors (BGR)
     COLOR_DETECTION = (0, 255, 0)      # Green
@@ -164,10 +149,11 @@ class OverlayRenderer:
         # Draw crosshair at center
         self._draw_crosshair(frame, self._frame_center[0], self._frame_center[1])
 
-        # Draw detections (skip if locked to save cycles)
-        if self.config.show_detections and not locked_target:
+        # Draw all detections in green (except the locked target)
+        if self.config.show_detections:
             for obj_id, obj in objects.items():
-                self._draw_detection(frame, obj, self.COLOR_DETECTION)
+                if locked_target is None or obj_id != locked_target.object_id:
+                    self._draw_detection(frame, obj, self.COLOR_DETECTION)
 
         # Draw locked target
         if self.config.show_locked_target and locked_target:
@@ -349,13 +335,7 @@ class OverlayRenderer:
 
 
 class UDPStreamer:
-    """
-    Video streamer using FFmpeg to send H.264 over UDP to QGroundControl.
-
-    Uses libx264 software encoder (Pi 5 has no hardware H.264 encoder).
-    On macOS, uses h264_videotoolbox if available.
-    QGC Settings: Video Source = UDP h.264 Video Stream, Port = 5600
-    """
+    """FFmpeg H.264/UDP streamer for QGroundControl."""
 
     def __init__(self, config: StreamerConfig):
         self.config = config
@@ -395,8 +375,7 @@ class UDPStreamer:
             )
             encoders = result.stdout
 
-            # Priority order: VideoToolbox (Mac) > libx264 (universal)
-            # Note: Pi 5 does NOT have hardware H.264 encoder (v4l2m2m unavailable)
+            # Pi 5 has no hardware encoder, so we use libx264
             if "h264_videotoolbox" in encoders:
                 logger.info("Using macOS VideoToolbox encoder")
                 return "h264_videotoolbox", ["-realtime", "true", "-prio_speed", "true"]
@@ -456,11 +435,7 @@ class UDPStreamer:
         # Add encoder-specific args
         ffmpeg_cmd.extend(encoder_args)
 
-        # Output: RTP over UDP for QGC
-        # Key latency settings:
-        # - Small GOP (keyframe interval) for faster sync
-        # - No B-frames (decode order = display order)
-        # - Minimal buffer
+        # RTP output with low-latency settings
         ffmpeg_cmd.extend([
             "-b:v", f"{self.config.bitrate_kbps}k",
             "-bufsize", f"{self.config.bitrate_kbps}k",  # 1 second buffer
@@ -494,7 +469,7 @@ class UDPStreamer:
                         try:
                             self._process.stderr.close()
                         except Exception:
-                            pass
+                            pass  # Ignore errors closing stderr
                 logger.error(f"FFmpeg failed to start: {stderr_text[:500]}")
                 self._process = None
                 return True  # Non-fatal

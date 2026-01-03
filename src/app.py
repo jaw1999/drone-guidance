@@ -1,15 +1,17 @@
 """Main application for Terminal Guidance."""
 
-import logging
+# Set thread counts before importing NumPy/NCNN (2 threads optimal on Pi 5)
 import os
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+
+import logging
 import signal
 import sys
 import threading
 import time
-
-# Enable OpenMP multi-threading for NCNN (4 cores on Pi 5)
-os.environ.setdefault("OMP_NUM_THREADS", "4")
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 # Constants
 MAX_CONSECUTIVE_ERRORS = 10
@@ -20,7 +22,7 @@ PERF_LOG_INTERVAL = 100  # frames
 import numpy as np
 
 from .core.camera import CameraCapture, CameraConfig
-from .core.detector import Detection, DetectorConfig, ObjectDetector
+from .core.detector import DetectorConfig, ObjectDetector
 from .core.tracker import TargetTracker, TrackerConfig, TrackingState
 from .core.pid import PIDConfig, PIDController
 from .core.mavlink_controller import (
@@ -72,7 +74,7 @@ class TerminalGuidance:
 
         # Detector
         det_config = DetectorConfig.from_dict(self.config)
-        logger.info(f"Using {det_config.backend.upper()} backend for detection")
+        logger.info(f"Using {det_config.model} @ {det_config.resolution}px (NCNN)")
         self._detector = ObjectDetector(det_config)
 
         if not self._detector.initialize():

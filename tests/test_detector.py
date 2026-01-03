@@ -44,10 +44,10 @@ class TestDetectorConfig:
         """Config uses defaults for empty dict."""
         config = DetectorConfig.from_dict({})
 
-        assert config.model == "yolo11n"
+        assert config.model == "yolov8n"
         assert config.confidence_threshold == 0.5
         assert config.input_size == 640
-        assert config.half_precision is False
+        assert config.resolution == "640"
 
     def test_target_classes_empty_means_all(self):
         """Empty target_classes list means detect all."""

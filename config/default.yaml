@@ -30,29 +30,18 @@ camera:
 
 # Detection Model Configuration
 # =============================
-# Performance on Raspberry Pi 5:
-#   NCNN (FP32):    ~130-160ms/frame (~6-8 FPS detection)
-#   TFLite INT8:    ~28ms/frame (~35 FPS detection) - RECOMMENDED
+# Available models: yolov8n (6.2MB), yolo11n (5.4MB - slightly faster)
+# Available resolutions: 640, 416, 320
 #
-# To use TFLite INT8:
-#   1. Run: python scripts/convert_to_tflite.py --int8
-#   2. Set backend: "tflite" below
+# Performance on Raspberry Pi 5 @ 3GHz (NCNN FP16):
+#   640 = best range (~90-130ms), 416 = balanced (~44ms), 320 = fastest (~35ms)
 #
 detector:
-  # Model selection: yolov8n (recommended), yolov8s, yolo11n, yolo11s
-  # YOLOv8n has more stable NCNN export on ARM
+  # Model: "yolov8n" or "yolo11n"
   model: "yolov8n"
 
-  # Backend: "ncnn" (default), "openvino", "pytorch"
-  backend: "ncnn"
-
-  # Path to custom model weights (optional, uses default if empty)
-  # For NCNN: "yolov8n_ncnn_model"
-  # For TFLite: "yolov8n_int8.tflite"
-  weights_path: "yolov8n_ncnn_model"
-
-  # Auto-export to NCNN format on first run (~4x faster on ARM)
-  auto_export_ncnn: false
+  # Detection resolution: "640", "416", or "320"
+  resolution: "640"
 
   # Inference settings
   confidence_threshold: 0.5
@@ -66,46 +55,16 @@ detector:
     - "truck"
     - "boat"
 
-  # Model input resolution (with NCNN backend)
-  # 640 = best for distance (~160ms)
-  # 416 = balanced (~100ms)
-  # 192 = close-range only (~50ms, fastest)
-  input_size: 640
-
-  # FP16 - not supported on Pi CPU, keep false
-  half_precision: false
-
   # Performance: run detection every N frames (1 = every frame)
   # Higher values reduce CPU load, tracker interpolates between
-  # Recommended: 3-5 for 30fps input (gives 6-10 detections/sec)
   detection_interval: 3
-
-  # Detection resolution (downscale camera frame before detection)
-  # This is independent of input_size - frame is resized to this first,
-  # then model resizes to input_size. Keep equal to input_size for best quality.
-  detection_resolution:
-    width: 640
-    height: 640
-
-  # ROI detection: when locked, only scan area around target
-  # Significantly faster when tracking (smaller area to process)
-  roi_detection:
-    enabled: true
-    padding_percent: 50  # Extra area around target bbox
 
 # Target Tracking Configuration
 tracker:
   # Tracking algorithm:
-  #   "nanotrack" - Siamese network tracker, best for maintaining lock (RECOMMENDED)
-  #   "bytetrack" - Kalman + IoU matching, handles multiple objects
+  #   "bytetrack" - Kalman + IoU matching, handles multiple objects (RECOMMENDED)
   #   "centroid"  - Simple centroid-based, fast but less robust
-  #
-  # NanoTrack advantages:
-  #   - 30-60+ FPS on RPi5 (very fast)
-  #   - Maintains lock through appearance changes
-  #   - Target-agnostic (tracks whatever you initialize on)
-  #   - Only 1.8MB models
-  algorithm: "nanotrack"
+  algorithm: "bytetrack"
 
   # Max frames to keep tracking without detection
   max_disappeared: 30
@@ -127,11 +86,6 @@ tracker:
     high_thresh: 0.5   # High confidence threshold for first association pass
     low_thresh: 0.1    # Low confidence threshold for second pass (catches occluded objects)
     match_thresh: 0.8  # IoU threshold for track-detection matching
-
-  # NanoTrack model paths (optional, uses defaults if not specified)
-  # nanotrack:
-  #   backbone: "models/nanotrack_backbone.onnx"
-  #   head: "models/nanotrack_head.onnx"
 
 # PID Controller Configuration
 # Tuned for fixed-wing intercept - gentle corrections to keep target in frame

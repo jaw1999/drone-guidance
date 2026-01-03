@@ -1,78 +1,80 @@
 #!/usr/bin/env python3
-"""Export YOLO model to NCNN format for faster inference on Raspberry Pi.
-
-NCNN is optimized for ARM devices and provides ~8x faster inference
-compared to PyTorch on Raspberry Pi 5.
+"""Export YOLO model to NCNN format for Raspberry Pi inference.
 
 Usage:
-    python scripts/export_ncnn.py [model_name]
-
-Examples:
-    python scripts/export_ncnn.py              # Export yolo11n (default)
-    python scripts/export_ncnn.py yolo11s      # Export yolo11s
-    python scripts/export_ncnn.py yolov8n      # Export yolov8n
+    python scripts/export_ncnn.py                    # Export all models/resolutions
+    python scripts/export_ncnn.py yolov8n 640       # Export specific model/resolution
+    python scripts/export_ncnn.py yolo11n 416       # Export yolo11n at 416px
 """
 
 import sys
 from pathlib import Path
 
+MODELS = ["yolov8n", "yolo11n"]
+RESOLUTIONS = [640, 416, 320]
 
-def export_to_ncnn(model_name: str = "yolo11n") -> bool:
-    """Export YOLO model to NCNN format.
 
-    Args:
-        model_name: Name of the model (e.g., yolo11n, yolo11s, yolov8n)
-
-    Returns:
-        True if export succeeded
-    """
+def export_model(model_name: str, resolution: int) -> bool:
+    """Export a YOLO model to NCNN format at specified resolution."""
     try:
         from ultralytics import YOLO
     except ImportError:
         print("Error: ultralytics not installed. Run: pip install ultralytics")
         return False
 
-    pt_path = Path(f"{model_name}.pt")
-    ncnn_path = Path(f"{model_name}_ncnn_model")
+    pt_path = Path(f"models/pt/{model_name}.pt")
+    ncnn_dir = Path(f"models/ncnn/{model_name}_{resolution}_ncnn_model")
 
-    # Check if already exported
-    if ncnn_path.exists():
-        print(f"NCNN model already exists: {ncnn_path}")
-        response = input("Re-export? [y/N]: ").strip().lower()
-        if response != 'y':
-            return True
-
-    print(f"Loading model: {model_name}.pt")
-    model = YOLO(str(pt_path))
-
-    print("Exporting to NCNN format...")
-    print("This may take a few minutes on first run (downloads NCNN tools)")
-
-    # Export to NCNN - this creates {model_name}_ncnn_model/ directory
-    model.export(format="ncnn", imgsz=320)
-
-    if ncnn_path.exists():
-        print(f"\nSuccess! NCNN model exported to: {ncnn_path}")
-        print(f"\nExpected performance on Raspberry Pi 5:")
-        print(f"  - PyTorch: ~800ms inference")
-        print(f"  - NCNN:    ~94ms inference (8x faster)")
-        print(f"\nThe detector will automatically use the NCNN model.")
-        return True
-    else:
-        print("Export may have failed - check for errors above")
+    if not pt_path.exists():
+        print(f"Error: {pt_path} not found")
         return False
+
+    if ncnn_dir.exists():
+        print(f"Skipping {ncnn_dir} (already exists)")
+        return True
+
+    print(f"Exporting {model_name} @ {resolution}px...")
+    model = YOLO(str(pt_path))
+    model.export(format="ncnn", imgsz=resolution, half=True)
+
+    # Move exported model to correct location
+    temp_dir = Path(f"models/pt/{model_name}_ncnn_model")
+    if temp_dir.exists():
+        ncnn_dir.parent.mkdir(parents=True, exist_ok=True)
+        temp_dir.rename(ncnn_dir)
+        print(f"  -> {ncnn_dir}")
+        # Clean up torchscript
+        ts_file = Path(f"models/pt/{model_name}.torchscript")
+        if ts_file.exists():
+            ts_file.unlink()
+        return True
+
+    print(f"  Export failed for {model_name} @ {resolution}")
+    return False
 
 
 def main():
-    model_name = sys.argv[1] if len(sys.argv) > 1 else "yolo11n"
+    Path("models/ncnn").mkdir(parents=True, exist_ok=True)
 
-    print("=" * 50)
-    print("  YOLO to NCNN Export for Raspberry Pi")
-    print("=" * 50)
-    print()
-
-    success = export_to_ncnn(model_name)
-    sys.exit(0 if success else 1)
+    if len(sys.argv) == 3:
+        # Export specific model/resolution
+        model = sys.argv[1]
+        resolution = int(sys.argv[2])
+        if model not in MODELS:
+            print(f"Error: model must be one of {MODELS}")
+            sys.exit(1)
+        if resolution not in RESOLUTIONS:
+            print(f"Error: resolution must be one of {RESOLUTIONS}")
+            sys.exit(1)
+        success = export_model(model, resolution)
+        sys.exit(0 if success else 1)
+    else:
+        # Export all combinations
+        print("Exporting all model/resolution combinations...")
+        for model in MODELS:
+            for res in RESOLUTIONS:
+                export_model(model, res)
+        print("\nDone!")
 
 
 if __name__ == "__main__":

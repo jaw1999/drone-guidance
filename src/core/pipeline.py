@@ -1,18 +1,4 @@
-"""Async processing pipeline for low-latency video processing.
-
-This module provides an asynchronous detection pipeline that separates
-frame capture from detection to maximize throughput. Features include:
-- Background detection thread with queue-based communication
-- Velocity-based interpolation for smooth tracking between detections
-- ROI-based detection for improved performance when tracking locked targets
-
-Classes:
-    FrameData: Container for frame and metadata.
-    PipelineConfig: Configuration for the pipeline.
-    DetectionWorker: Background thread for detection.
-    TrackingInterpolator: Smooths tracking between detection frames.
-    Pipeline: Main async processing pipeline.
-"""
+"""Async detection pipeline with velocity interpolation."""
 
 import logging
 import threading
@@ -21,7 +7,6 @@ from dataclasses import dataclass, field
 from queue import Queue, Empty, Full
 from typing import Dict, List, Optional, Tuple
 
-import cv2
 import numpy as np
 
 from .detector import Detection, ObjectDetector
@@ -78,8 +63,6 @@ class DetectionWorker:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-        # (Removed _detect_buffer - no longer needed since we pass full frames)
-
     @property
     def output_queue(self) -> Queue[Tuple[List[Detection], float, float, int]]:
         return self._output_queue
@@ -110,10 +93,6 @@ class DetectionWorker:
 
     def _run(self) -> None:
         """Main detection loop."""
-        det_w, det_h = self.config.detection_width, self.config.detection_height
-
-        # (Buffer pre-allocation removed - we pass full frames now)
-
         while self._running:
             try:
                 item = self._input_queue.get(timeout=0.1)
@@ -121,7 +100,6 @@ class DetectionWorker:
                 continue
 
             try:
-                unpack_start = time.perf_counter()
                 frame, timestamp, frame_id, orig_size = item
 
                 if frame is None or frame.size == 0:
@@ -133,22 +111,14 @@ class DetectionWorker:
                     logger.warning("Frame has zero dimensions, skipping")
                     continue
 
-                unpack_ms = (time.perf_counter() - unpack_start) * 1000
-
                 # Run detection on FULL frame (YOLO handles resize internally)
-                detect_start = time.perf_counter()
                 detections = self.detector.detect(frame)
-                detect_ms = (time.perf_counter() - detect_start) * 1000
 
                 # Use actual model inference time (more accurate)
                 inference_ms = self.detector._inference_time * 1000
 
                 # Build output (detections already in correct coordinates)
-                package_start = time.perf_counter()
                 result = (detections, timestamp, inference_ms, frame_id)
-                package_ms = (time.perf_counter() - package_start) * 1000
-
-                total_worker_ms = (time.perf_counter() - unpack_start) * 1000
 
                 try:
                     self._output_queue.put_nowait(result)
@@ -168,13 +138,7 @@ class DetectionWorker:
 
 
 class TrackingInterpolator:
-    """Interpolates tracking between detection frames using velocity.
-
-    Optimized for smooth tracking:
-    - Always predicts to current time for consistent motion
-    - Uses smoothed positions to reduce jitter
-    - Stores lightweight tuples instead of deep copies for performance
-    """
+    """Interpolates tracking between detection frames using velocity."""
 
     def __init__(self):
         # Store essential data as tuples: (center, bbox, velocity, class_name, confidence, frames_visible, frames_missing, last_update)
@@ -281,12 +245,7 @@ class TrackingInterpolator:
 
 
 class Pipeline:
-    """
-    Async video processing pipeline.
-
-    Separates capture, detection, and output into concurrent stages
-    for maximum throughput on limited hardware.
-    """
+    """Async video processing pipeline with concurrent detection."""
 
     def __init__(
         self,
@@ -347,7 +306,7 @@ class Pipeline:
         )
 
         # Check for completed detection results
-        had_detection_results = self._collect_detection_results(frame=frame)
+        self._collect_detection_results()
 
         # Decide if we should run detection this frame
         frames_since_detect = self._frame_count - self._last_detection_frame
@@ -360,31 +319,33 @@ class Pipeline:
             ):
                 self._last_detection_frame = self._frame_count
 
-        # For NanoTrack: update tracker every frame for continuous tracking
-        # NanoTrack needs the frame on every update, not just when detections arrive
-        uses_nanotrack = hasattr(self.tracker, '_uses_nanotrack') and self.tracker._uses_nanotrack
-        if uses_nanotrack:
-            # Only update if we didn't already update with detection results this frame
-            if not had_detection_results:
-                self.tracker.update([], frame=frame)
-            # Use fresh tracker data directly (NanoTrack updates position each frame)
-            frame_data.tracked_objects = self.tracker.all_targets
-            frame_data.locked_target = self.tracker.locked_target
-        else:
-            # For other trackers: use interpolated positions for smooth motion
-            predicted = self._interpolator.interpolate(now)
-            if predicted:
-                frame_data.tracked_objects = predicted
-                # Get interpolated locked target position
-                locked = self.tracker.locked_target
-                if locked and locked.object_id in predicted:
-                    frame_data.locked_target = predicted[locked.object_id]
+        # Get all tracked objects from tracker (includes objects being tracked
+        # even if they weren't detected in the last frame via max_disappeared)
+        all_targets = self.tracker.all_targets
+        locked = self.tracker.locked_target
+
+        # Use interpolated positions for smoother motion, but fall back to
+        # tracker positions for objects not in interpolator
+        predicted = self._interpolator.interpolate(now)
+        if predicted:
+            # Merge: use interpolated positions where available, tracker for the rest
+            merged = {}
+            for obj_id, obj in all_targets.items():
+                if obj_id in predicted:
+                    merged[obj_id] = predicted[obj_id]
                 else:
-                    frame_data.locked_target = locked
+                    merged[obj_id] = obj
+            frame_data.tracked_objects = merged
+
+            # Get interpolated locked target position
+            if locked and locked.object_id in predicted:
+                frame_data.locked_target = predicted[locked.object_id]
             else:
-                # No predictions yet, use raw tracker data
-                frame_data.tracked_objects = self.tracker.all_targets
-                frame_data.locked_target = self.tracker.locked_target
+                frame_data.locked_target = locked
+        else:
+            # No predictions yet, use raw tracker data
+            frame_data.tracked_objects = all_targets
+            frame_data.locked_target = locked
 
         frame_data.tracking_state = self.tracker.state
         frame_data.detections = self._last_detections
@@ -400,14 +361,11 @@ class Pipeline:
 
         return frame_data
 
-    def _collect_detection_results(self, frame: Optional[np.ndarray] = None) -> bool:
+    def _collect_detection_results(self) -> bool:
         """Check for and process ALL completed detection results.
 
         Drains the queue to prevent stale results from accumulating.
         Only the most recent result is used for tracker state.
-
-        Args:
-            frame: Current video frame (required for NanoTrack)
 
         Returns:
             True if detection results were processed, False otherwise
@@ -428,14 +386,16 @@ class Pipeline:
         # Unpack tuple: (detections, timestamp, inference_ms, frame_id)
         detections, timestamp, inference_ms, frame_id = latest_result
 
-        # Update tracker with new detections (pass frame for NanoTrack)
-        self.tracker.update(detections, frame=frame)
+        # Update tracker with new detections
+        self.tracker.update(detections)
         self._last_detections = detections
         self._inference_ms = inference_ms
 
+        all_targets = self.tracker.all_targets
+
         # Update interpolator with fresh tracking data
         self._interpolator.update_from_detection(
-            self.tracker.all_targets,
+            all_targets,
             timestamp,
         )
         return True

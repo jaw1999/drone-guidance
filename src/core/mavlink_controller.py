@@ -12,16 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """
-    Calculate distance between two GPS coordinates using Haversine formula.
-
-    Args:
-        lat1, lon1: First coordinate (degrees)
-        lat2, lon2: Second coordinate (degrees)
-
-    Returns:
-        Distance in meters
-    """
+    """Calculate distance between two GPS coordinates in meters."""
     R = 6371000  # Earth radius in meters
 
     phi1 = math.radians(lat1)
@@ -175,16 +166,7 @@ class VehicleState:
 
 
 class MAVLinkController:
-    """
-    MAVLink interface for ArduPilot flight controller.
-
-    Handles:
-    - Connection management
-    - Heartbeat sending
-    - Telemetry reception
-    - Control command transmission
-    - Safety monitoring
-    """
+    """MAVLink interface for ArduPilot flight controller."""
 
     def __init__(self, mav_config: MAVLinkConfig, safety_config: SafetyConfig):
         self.mav_config = mav_config

@@ -54,7 +54,7 @@ class PIDConfig:
 
 
 class PIDAxis:
-    """Single-axis PID controller with anti-windup, derivative filtering, and slew rate limiting."""
+    """Single-axis PID with anti-windup and derivative filtering."""
 
     MIN_KI_FOR_LIMIT = 0.001  # Minimum ki to calculate meaningful integral limit
 
@@ -169,11 +169,7 @@ class ControlOutput:
 
 
 class PIDController:
-    """
-    Multi-axis PID controller for target tracking.
-
-    Converts tracking error to flight control commands.
-    """
+    """Multi-axis PID controller for target tracking."""
 
     def __init__(self, config: PIDConfig):
         self.config = config

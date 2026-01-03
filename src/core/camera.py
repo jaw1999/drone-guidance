@@ -1,11 +1,13 @@
 """Camera capture module for RTSP stream ingestion."""
 
-import cv2
+import logging
+import os
 import threading
 import time
-import logging
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Callable, Optional
+
+import cv2
 import numpy as np
 
 logger = logging.getLogger(__name__)
@@ -44,12 +46,7 @@ class CameraConfig:
 
 
 class CameraCapture:
-    """
-    Handles RTSP stream capture with automatic reconnection.
-
-    Uses a separate thread for capture to minimize latency and
-    prevent frame buffering issues.
-    """
+    """RTSP stream capture with automatic reconnection."""
 
     def __init__(self, config: CameraConfig):
         self.config = config
@@ -100,7 +97,6 @@ class CameraCapture:
         # RTSP or HTTP stream
         if url.startswith(("rtsp://", "http://", "https://")):
             # Set FFmpeg options for low latency (UDP)
-            import os
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay|framedrop;1"
             return url, cv2.CAP_FFMPEG
 

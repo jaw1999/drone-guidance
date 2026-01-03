@@ -1,15 +1,10 @@
-"""Object detection module using YOLO models.
+"""YOLO object detection with NCNN backend for Pi 5."""
 
-Optimized for Raspberry Pi 5 with support for:
-- NCNN format (best for Pi 5 real-time, ~130ms at 640px)
-- OpenVINO format (better throughput, worse latency due to batch mode)
-- Configurable input resolution (320/416/640)
-- ROI-based detection for locked targets
-"""
-
-# CRITICAL: Set OpenMP threads BEFORE any imports (NumPy, NCNN, etc.)
+# Set thread counts before importing NumPy/NCNN (2 threads optimal on Pi 5)
 import os
-os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["OPENBLAS_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
 
 import logging
 import time
@@ -20,8 +15,16 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Environment variable to force model re-export
-FORCE_EXPORT = os.environ.get("FORCE_EXPORT", "0") == "1"
+
+# Available models and resolutions
+AVAILABLE_MODELS = ["yolov8n", "yolo11n"]
+AVAILABLE_RESOLUTIONS = ["640", "416", "320"]
+
+
+def get_model_path(model: str, resolution: str) -> str:
+    """Get the NCNN model path for a given model and resolution."""
+    # Ultralytics expects *_ncnn_model suffix for NCNN detection
+    return f"models/ncnn/{model}_{resolution}_ncnn_model"
 
 
 @dataclass
@@ -50,45 +53,48 @@ class Detection:
 class DetectorConfig:
     """Detector configuration parameters.
 
-    Performance notes for Raspberry Pi 5:
-    - NCNN is best for real-time (~130ms at 640px with FP16)
-    - OpenVINO has worse latency due to batch mode (~200ms)
-    - input_size 640 needed for distance detection, 480 for balanced, 320 for close-range
-    - YOLO11n is recommended (faster than YOLOv8n on ARM)
-    - Use detection_interval in pipeline config to skip frames (tracker interpolates)
+    Performance notes for Raspberry Pi 5 @ 3GHz:
+    - 640: Best detection range (~128ms, ~7.8 FPS)
+    - 416: Balanced speed/range (~44ms, ~22.7 FPS)
+    - 320: Fastest, close-range only (~50ms, ~20 FPS)
     """
-    model: str = "yolo11n"
-    weights_path: str = ""
+    model: str = "yolov8n"  # "yolov8n" or "yolo11n"
+    resolution: str = "640"  # "640", "416", or "320"
     confidence_threshold: float = 0.5
     nms_threshold: float = 0.45
     target_classes: List[str] = field(default_factory=list)
-    input_size: int = 640  # 640 for distance, 480 balanced, 320 close-range only
-    half_precision: bool = False  # FP16 not supported on Pi CPU
-    backend: str = "ncnn"  # "ncnn" (best for Pi 5), "openvino", or "pytorch"
+    detection_interval: int = 3
+
+    @property
+    def input_size(self) -> int:
+        """Get input size for current resolution."""
+        return int(self.resolution) if self.resolution in AVAILABLE_RESOLUTIONS else 640
+
+    @property
+    def weights_path(self) -> str:
+        """Get absolute model path for current model and resolution."""
+        model = self.model if self.model in AVAILABLE_MODELS else "yolov8n"
+        resolution = self.resolution if self.resolution in AVAILABLE_RESOLUTIONS else "640"
+        rel_path = get_model_path(model, resolution)
+        # Return absolute path - Ultralytics needs this for NCNN detection
+        return str(Path(rel_path).resolve())
 
     @classmethod
     def from_dict(cls, config: dict) -> "DetectorConfig":
         """Create config from dictionary."""
         det = config.get("detector", {})
         return cls(
-            model=det.get("model", "yolo11n"),
-            weights_path=det.get("weights_path", ""),
+            model=det.get("model", "yolov8n"),
+            resolution=str(det.get("resolution", "640")),
             confidence_threshold=det.get("confidence_threshold", 0.5),
             nms_threshold=det.get("nms_threshold", 0.45),
             target_classes=det.get("target_classes", []),
-            input_size=det.get("input_size", 640),
-            half_precision=det.get("half_precision", False),
-            backend=det.get("backend", "ncnn"),
+            detection_interval=det.get("detection_interval", 3),
         )
 
 
 class ObjectDetector:
-    """
-    YOLO-based object detector optimized for Raspberry Pi 5.
-
-    Supports YOLOv8 and YOLOv5 models with configurable precision
-    and target class filtering.
-    """
+    """YOLOv8n/YOLO11n detector with NCNN backend."""
 
     def __init__(self, config: DetectorConfig):
         self.config = config
@@ -111,50 +117,8 @@ class ObjectDetector:
         """Check if model is loaded."""
         return self._initialized
 
-    def _export_model(self, pt_path: Path, backend: str) -> Optional[Path]:
-        """Export PyTorch model to optimized format for faster inference.
-
-        Args:
-            pt_path: Path to the .pt model file
-            backend: Target format ("openvino" or "ncnn")
-
-        Returns:
-            Path to exported model, or None if export failed
-        """
-        try:
-            from ultralytics import YOLO
-            logger.info(f"Exporting {pt_path} to {backend.upper()} format (this may take a minute)...")
-
-            model = YOLO(str(pt_path))
-
-            if backend == "openvino":
-                # OpenVINO is fastest on Pi 5 (~80ms vs 130ms NCNN)
-                export_path = model.export(format="openvino")
-            else:
-                # NCNN fallback, half precision for speed
-                export_path = model.export(format="ncnn", half=True)
-
-            if export_path and Path(export_path).exists():
-                logger.info(f"{backend.upper()} export successful: {export_path}")
-                return Path(export_path)
-            else:
-                logger.warning(f"{backend.upper()} export completed but path not found")
-                return None
-
-        except Exception as e:
-            logger.warning(f"{backend.upper()} export failed: {e}")
-            logger.info("Falling back to PyTorch model (slower inference)")
-            return None
-
     def initialize(self) -> bool:
-        """Load and prepare the detection model.
-
-        Model loading priority:
-        1. Custom weights_path if specified
-        2. OpenVINO format (fastest on Pi 5, ~80ms)
-        3. NCNN format (fallback, ~130ms)
-        4. PyTorch format (auto-exports to preferred backend)
-        """
+        """Load and prepare the detection model."""
         try:
             from ultralytics import YOLO
         except ImportError as e:
@@ -163,42 +127,12 @@ class ObjectDetector:
             return False
 
         try:
-            # Determine model path - prefer optimized formats for speed
-            if self.config.weights_path and Path(self.config.weights_path).exists():
-                model_path = self.config.weights_path
-                logger.info(f"Loading custom weights: {model_path}")
-            else:
-                backend = self.config.backend.lower()
-                pt_path = Path(f"{self.config.model}.pt")
+            model_path = self.config.weights_path
+            if not Path(model_path).exists():
+                logger.error(f"Model not found: {model_path}")
+                return False
 
-                # Check for pre-exported models
-                openvino_path = Path(f"{self.config.model}_openvino_model")
-                ncnn_path = Path(f"{self.config.model}_ncnn_model")
-
-                if backend == "openvino" and openvino_path.exists() and not FORCE_EXPORT:
-                    model_path = str(openvino_path)
-                    logger.info(f"Loading OpenVINO model: {model_path} (fastest on Pi 5)")
-                elif backend == "ncnn" and ncnn_path.exists() and not FORCE_EXPORT:
-                    model_path = str(ncnn_path)
-                    logger.info(f"Loading NCNN model: {model_path}")
-                elif pt_path.exists():
-                    # Auto-export to preferred backend
-                    if backend in ("openvino", "ncnn"):
-                        exported = self._export_model(pt_path, backend)
-                        if exported:
-                            model_path = str(exported)
-                        else:
-                            model_path = str(pt_path)
-                            logger.info(f"Loading PyTorch model: {model_path}")
-                    else:
-                        model_path = str(pt_path)
-                        logger.info(f"Loading PyTorch model: {model_path}")
-                else:
-                    # Model doesn't exist locally - let ultralytics download it
-                    model_path = f"{self.config.model}.pt"
-                    logger.info(f"Model not found locally, downloading: {model_path}")
-
-            # Load model (ultralytics auto-downloads if model_path is a known model name)
+            logger.info(f"Loading NCNN model: {model_path} (resolution: {self.config.resolution})")
             self._model = YOLO(model_path)
 
             # Get class names from model
@@ -229,7 +163,6 @@ class ObjectDetector:
                 dummy,
                 imgsz=self.config.input_size,
                 conf=self.config.confidence_threshold,
-                half=self.config.half_precision,
                 verbose=False,
                 device='cpu',
                 max_det=30,
@@ -237,13 +170,11 @@ class ObjectDetector:
             logger.info("Warmup complete")
 
             self._initialized = True
-            logger.info(f"Detector initialized: {self.config.model}")
+            logger.info(f"Detector initialized: {self.config.model} @ {self.config.resolution}px (NCNN)")
             return True
 
         except RuntimeError as e:
             logger.error(f"Runtime error loading model: {e}")
-            if "CUDA" in str(e):
-                logger.error("CUDA error - try setting half_precision=False or use CPU")
             return False
         except Exception as e:
             logger.error(f"Failed to initialize detector: {e}", exc_info=True)

@@ -4,7 +4,7 @@ Drone companion computer software for Raspberry Pi 5. Performs real-time object 
 
 ## Features
 
-- YOLO11n detection with NCNN backend (~160ms at 640px, ~100ms at 416px)
+- YOLOv8n/YOLO11n detection with NCNN backend (~120ms at 640px, ~70ms at 416px)
 - Target tracking with ByteTrack (Kalman filter) or centroid tracker
 - PID control for yaw/pitch adjustment to keep target centered
 - UDP H.264 video stream with overlay to QGroundControl (port 5600)
@@ -14,7 +14,7 @@ Drone companion computer software for Raspberry Pi 5. Performs real-time object 
 
 ## Requirements
 
-- Raspberry Pi 5 (4GB+ RAM)
+- Raspberry Pi 5 (4GB+ RAM, overclocked to 3GHz recommended)
 - Python 3.11+
 - FFmpeg (uses libx264 software encoder)
 - Camera (USB, CSI, or RTSP stream)
@@ -38,9 +38,9 @@ python -m src.app
 Edit `config/default.yaml`:
 
 - **camera** - RTSP URL, webcam index, or video file path
-- **detector** - Model, confidence threshold, target classes, input size
-- **tracker** - Algorithm (bytetrack/centroid), lock-on thresholds, max disappeared frames
-- **pid** - Yaw/pitch/throttle gains, dead zone, max rates, slew rate limiting
+- **detector** - Model, resolution, confidence threshold, target classes
+- **tracker** - Algorithm (bytetrack/centroid), lock-on thresholds
+- **pid** - Yaw/pitch gains, dead zone, max rates, slew rate limiting
 - **mavlink** - Flight controller connection string, system IDs
 - **safety** - Target lost action, geofence, battery limits
 - **output** - Resolution, bitrate, UDP destination
@@ -49,16 +49,17 @@ Edit `config/default.yaml`:
 
 ```yaml
 detector:
-  model: "yolo11n"
-  backend: "ncnn"
-  weights_path: "yolo11n_ncnn_model"
-  input_size: 640              # 192, 416, or 640
-  detection_interval: 3        # Run detection every N frames
+  model: "yolov8n"           # "yolov8n" or "yolo11n"
+  resolution: "640"          # "640", "416", or "320"
+  detection_interval: 3      # Run detection every N frames
   confidence_threshold: 0.5
-  half_precision: false        # Not supported on Pi 5 CPU
+  target_classes:
+    - "person"
+    - "car"
+    - "boat"
 
 tracker:
-  algorithm: "bytetrack"       # "bytetrack" or "centroid"
+  algorithm: "bytetrack"     # "bytetrack" or "centroid"
   max_disappeared: 30
   lock_on:
     frames_to_lock: 5
@@ -70,13 +71,13 @@ tracker:
 
 pid:
   yaw:
-    kp: 0.5
-    ki: 0.01
-    kd: 0.1
-    max_rate: 30.0
-    derivative_filter: 0.1     # Low-pass filter (0=heavy, 1=none)
-    slew_rate: 60.0            # Max rate change per second
-  dead_zone_percent: 5.0
+    kp: 0.3
+    ki: 0.005
+    kd: 0.15
+    max_rate: 15.0
+    derivative_filter: 0.2
+    slew_rate: 20.0
+  dead_zone_percent: 10.0
 
 output:
   stream:
@@ -89,7 +90,7 @@ mavlink:
   enable_control: false
 
 safety:
-  target_lost_action: "loiter"  # hover, loiter, rtl, land
+  target_lost_action: "loiter"
   min_battery_percent: 20
   geofence:
     max_distance_m: 500
@@ -113,6 +114,7 @@ Video overlay shows:
 Access at `http://<pi-ip>:5000`:
 
 - System status (FPS, inference time, targets)
+- Model/resolution selection (switch without restart)
 - Flight controller connection config
 - PID gain tuning
 - Detection parameters
@@ -126,7 +128,7 @@ Access at `http://<pi-ip>:5000`:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         Raspberry Pi 5                              │
 │                                                                     │
-│  Camera -> Detection (YOLO11n) -> Tracking -> PID Controller        │
+│  Camera -> Detection (YOLO) -> Tracking -> PID Controller           │
 │                 |                                  |                │
 │           Overlay Renderer                    MAVLink UDP           │
 │                 |                                  |                │
@@ -149,24 +151,35 @@ Access at `http://<pi-ip>:5000`:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Data Flow:**
-1. QGC custom tab sends HTTP requests to Pi's Flask API (port 5000)
-2. Pi processes commands and sends MAVLink rate commands to flight controller
-3. Pi streams H.264 video with overlay to QGC (port 5600)
-
 ### Components
 
 | File | Description |
 |------|-------------|
 | `src/app.py` | Main application, coordinates all components |
 | `src/core/camera.py` | Video capture with auto-reconnection |
-| `src/core/detector.py` | YOLO inference wrapper (NCNN/OpenVINO/PyTorch) |
+| `src/core/detector.py` | YOLO inference with NCNN backend |
 | `src/core/tracker.py` | ByteTrack and centroid tracker with lock-on state machine |
 | `src/core/pipeline.py` | Async detection with velocity interpolation |
 | `src/core/pid.py` | PID controller with derivative filtering and slew rate limiting |
 | `src/core/mavlink_controller.py` | ArduPilot communication |
 | `src/core/streamer.py` | FFmpeg UDP streaming with overlay |
 | `src/web/app.py` | Flask configuration UI |
+
+### Model Directory Structure
+
+```
+models/
+├── ncnn/
+│   ├── yolov8n_640_ncnn_model/
+│   ├── yolov8n_416_ncnn_model/
+│   ├── yolov8n_320_ncnn_model/
+│   ├── yolo11n_640_ncnn_model/
+│   ├── yolo11n_416_ncnn_model/
+│   └── yolo11n_320_ncnn_model/
+└── pt/
+    ├── yolov8n.pt
+    └── yolo11n.pt
+```
 
 ### Tracking States
 
@@ -181,21 +194,19 @@ Access at `http://<pi-ip>:5000`:
 
 Raspberry Pi 5 with NCNN backend (CPU-only):
 
-| Input Size | Inference Time | Detection FPS |
-|------------|----------------|---------------|
-| 640px | ~160ms | ~6 |
-| 416px | ~100ms | ~10 |
-| 192px | ~50ms | ~20 |
+| Model | Resolution | Stock (2.4GHz) | OC (3GHz) |
+|-------|------------|----------------|-----------|
+| YOLOv8n | 640px | ~150ms | ~120ms |
+| YOLOv8n | 416px | ~90ms | ~70ms |
+| YOLOv8n | 320px | ~70ms | ~55ms |
 
-Notes:
-- NCNN backend provides ~4x speedup over PyTorch
-- `detection_interval: 3` skips frames; tracker interpolates between detections
-- FP16 not supported on Pi 5 CPU
-- Pipeline maintains 30 FPS output with velocity interpolation
+Threading: NCNN runs best with 1-2 threads on Pi 5 (set via OMP_NUM_THREADS).
+
+The pipeline uses `detection_interval` to skip frames between detections.
+ByteTrack interpolates positions using Kalman-predicted velocities, so the
+output stream stays smooth at 30 FPS even when detection runs at 8-15 FPS.
 
 ## HTTP API
-
-The QGC custom plugin controls Terminal Guidance via REST API calls to the Raspberry Pi.
 
 ### Tracking Control
 
@@ -214,6 +225,7 @@ The QGC custom plugin controls Terminal Guidance via REST API calls to the Raspb
 | `/api/status` | GET | System status (FPS, targets, state) |
 | `/api/config` | GET | Current configuration |
 | `/api/config` | POST | Update configuration (JSON body) |
+| `/api/detector/switch` | POST | Switch model/resolution |
 | `/api/emergency-stop` | POST | Activate emergency stop |
 | `/api/emergency-stop/clear` | POST | Clear emergency stop |
 
@@ -236,6 +248,11 @@ curl http://192.168.1.100:5000/api/status
 
 # Lock onto a target
 curl -X POST http://192.168.1.100:5000/api/tracking/lock
+
+# Switch to faster model/resolution
+curl -X POST http://192.168.1.100:5000/api/detector/switch \
+  -H "Content-Type: application/json" \
+  -d '{"model": "yolov8n", "resolution": "416"}'
 
 # Update detection confidence
 curl -X POST http://192.168.1.100:5000/api/config \
@@ -261,7 +278,4 @@ journalctl -u terminal-guidance -f
 pytest
 
 python -m src.app --log-level DEBUG
-
-python -m src.app --no-web
 ```
-
