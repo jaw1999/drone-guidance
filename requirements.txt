@@ -1,19 +1,29 @@
 # Terminal Guidance Dependencies
-# For Raspberry Pi 5
+# For Raspberry Pi 5 with NCNN backend
+#
+# System dependencies (install via apt first):
+#   sudo apt install -y python3-ncnn ffmpeg
+#
+# Then install Python packages:
+#   pip install -r requirements.txt
+
+# Build tools
+wheel==0.45.1
+setuptools==80.9.0
 
 # Core
 numpy==1.26.4
 opencv-python-headless==4.9.0.80
 PyYAML==6.0.1
 
-# Detection (includes torch, scipy, ncnn support)
+# Detection (YOLO with NCNN export support)
 ultralytics==8.3.40
 
 # MAVLink
 pymavlink==2.4.41
 
 # Web UI
-flask==3.0.3
+Flask==3.0.3
 
 # System monitoring
 psutil==5.9.8

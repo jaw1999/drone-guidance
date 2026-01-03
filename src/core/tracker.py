@@ -1,4 +1,11 @@
-"""Target tracking module with lock-on capability."""
+"""
+Target tracking with lock-on capability.
+
+Provides object tracking across frames with support for:
+- Centroid-based tracking (simple, fast)
+- ByteTrack algorithm (Kalman filter + IoU matching, more robust)
+- Automatic target lock-on and re-acquisition
+"""
 
 import logging
 import time
@@ -13,60 +20,63 @@ from .detector import Detection
 
 logger = logging.getLogger(__name__)
 
-# Tracking constants
-MIN_VELOCITY_DT = 0.01  # Minimum time delta for velocity calculation (seconds)
-MAX_VELOCITY_DT = 1.0   # Maximum time delta before considering update stale
-VELOCITY_SMOOTHING_ALPHA = 0.3  # Exponential smoothing factor for velocity
-REACQUIRE_RADIUS_MULTIPLIER = 3  # Multiplier for max_distance when reacquiring
-FRAME_TIME_ESTIMATE = 0.033  # Assumed frame time for prediction (~30fps)
-MIN_MATCH_SCORE = 0.5  # Minimum score for target reacquisition match
+# Velocity estimation constants
+MIN_VELOCITY_DT = 0.01  # Minimum dt to avoid noise
+MAX_VELOCITY_DT = 1.0   # Maximum dt before stale
+VELOCITY_SMOOTHING = 0.3  # Exponential smoothing factor
+
+# Target re-acquisition
+REACQUIRE_RADIUS_MULT = 3  # Search radius multiplier
+FRAME_TIME_ESTIMATE = 0.033  # ~30fps assumed
+MIN_MATCH_SCORE = 0.5  # Minimum score for reacquisition
 
 
 class TrackingState(Enum):
     """Target tracking states."""
-    SEARCHING = "searching"      # Looking for targets
-    ACQUIRING = "acquiring"      # Target found, confirming lock
-    LOCKED = "locked"           # Target locked, tracking active
-    LOST = "lost"               # Target lost, searching
+    SEARCHING = "searching"  # Looking for targets
+    ACQUIRING = "acquiring"  # Confirming lock on candidate
+    LOCKED = "locked"        # Actively tracking target
+    LOST = "lost"            # Target lost, attempting reacquisition
 
 
 @dataclass
 class TrackedObject:
-    """Represents a tracked object."""
+    """Tracked object with position and velocity."""
     object_id: int
     class_name: str
     center: Tuple[int, int]
-    bbox: Tuple[int, int, int, int]
+    bbox: Tuple[int, int, int, int]  # x1, y1, x2, y2
     confidence: float
     frames_visible: int = 1
     frames_missing: int = 0
-    velocity: Tuple[float, float] = (0.0, 0.0)
+    velocity: Tuple[float, float] = (0.0, 0.0)  # pixels/second
     last_update: float = 0.0
 
     def predict_position(self, dt: float = 1.0) -> Tuple[int, int]:
-        """Predict next position based on velocity."""
-        px = int(self.center[0] + self.velocity[0] * dt)
-        py = int(self.center[1] + self.velocity[1] * dt)
-        return (px, py)
+        """Predict position after dt seconds."""
+        return (
+            int(self.center[0] + self.velocity[0] * dt),
+            int(self.center[1] + self.velocity[1] * dt),
+        )
 
 
 @dataclass
 class TrackerConfig:
-    """Tracker configuration parameters."""
+    """Tracker configuration."""
     algorithm: str = "centroid"  # "centroid" or "bytetrack"
-    max_disappeared: int = 30
-    max_distance: int = 100
-    min_confidence: float = 0.6
-    frames_to_lock: int = 5
-    frames_to_unlock: int = 15
-    # ByteTrack-specific parameters
-    high_thresh: float = 0.5  # High confidence threshold for first association
-    low_thresh: float = 0.1  # Low confidence threshold for second association
+    max_disappeared: int = 30    # Frames before removing lost object
+    max_distance: int = 100      # Max pixels for centroid matching
+    min_confidence: float = 0.6  # Min confidence for lock-on
+    frames_to_lock: int = 5      # Frames to confirm lock
+    frames_to_unlock: int = 15   # Frames before declaring lost
+
+    # ByteTrack parameters
+    high_thresh: float = 0.5   # High confidence threshold
+    low_thresh: float = 0.1    # Low confidence threshold
     match_thresh: float = 0.8  # IoU threshold for matching
 
     @classmethod
     def from_dict(cls, config: dict) -> "TrackerConfig":
-        """Create config from dictionary."""
         tracker = config.get("tracker", {})
         lock_on = tracker.get("lock_on", {})
         bytetrack = tracker.get("bytetrack", {})
@@ -83,163 +93,155 @@ class TrackerConfig:
         )
 
 
+# =============================================================================
+# Centroid Tracker
+# =============================================================================
+
 class CentroidTracker:
-    """Simple centroid-based object tracker."""
+    """
+    Simple centroid-based tracker.
+
+    Matches detections to existing tracks by nearest centroid distance.
+    Fast but less robust than ByteTrack for occlusions.
+    """
 
     def __init__(self, max_disappeared: int = 30, max_distance: int = 100):
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
-        self._next_object_id = 0
+
+        self._next_id = 0
         self._objects: OrderedDict[int, TrackedObject] = OrderedDict()
         self._disappeared: Dict[int, int] = {}
 
     @property
     def objects(self) -> Dict[int, TrackedObject]:
-        """Get all tracked objects."""
         return dict(self._objects)
 
     def update(self, detections: List[Detection]) -> Dict[int, TrackedObject]:
-        """
-        Update tracker with new detections.
+        """Update tracker with new detections."""
+        now = time.time()
 
-        Args:
-            detections: List of Detection objects from detector
-
-        Returns:
-            Dictionary of object_id -> TrackedObject
-        """
-        current_time = time.time()
-
-        # No detections - mark all as disappeared
-        if len(detections) == 0:
-            # Collect IDs to deregister (can't modify dict during iteration)
-            to_deregister = []
-            for object_id in self._disappeared:
-                self._disappeared[object_id] += 1
-                if object_id in self._objects:
-                    self._objects[object_id].frames_missing += 1
-                if self._disappeared[object_id] > self.max_disappeared:
-                    to_deregister.append(object_id)
-            for object_id in to_deregister:
-                self._deregister(object_id)
+        # No detections - increment disappeared count for all
+        if not detections:
+            to_remove = []
+            for oid in self._disappeared:
+                self._disappeared[oid] += 1
+                if oid in self._objects:
+                    self._objects[oid].frames_missing += 1
+                if self._disappeared[oid] > self.max_disappeared:
+                    to_remove.append(oid)
+            for oid in to_remove:
+                self._deregister(oid)
             return self.objects
 
-        # No existing objects - register all new detections
-        if len(self._objects) == 0:
-            for detection in detections:
-                self._register(detection, current_time)
-        else:
-            # Match existing objects to new detections
-            object_ids = tuple(self._objects.keys())  # tuple is lighter than list
+        # No existing objects - register all
+        if not self._objects:
+            for det in detections:
+                self._register(det, now)
+            return self.objects
 
-            # Vectorized distance calculation using NumPy broadcasting
-            # Build center arrays for vectorized computation
-            obj_centers = np.array([self._objects[oid].center for oid in object_ids], dtype=np.float32)
-            det_centers = np.array([det.center for det in detections], dtype=np.float32)
+        # Match existing objects to detections using vectorized distance
+        object_ids = tuple(self._objects.keys())
+        obj_centers = np.array(
+            [self._objects[oid].center for oid in object_ids],
+            dtype=np.float32
+        )
+        det_centers = np.array(
+            [d.center for d in detections],
+            dtype=np.float32
+        )
 
-            # Broadcast: (n_obj, 1, 2) - (1, n_det, 2) = (n_obj, n_det, 2)
-            diff = obj_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :]
-            D = np.sum(diff * diff, axis=2)  # Squared distances (n_obj, n_det)
+        # Compute squared distances (no sqrt needed for comparison)
+        diff = obj_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :]
+        dist_sq = np.sum(diff * diff, axis=2)
+        max_dist_sq = self.max_distance * self.max_distance
 
-            max_dist_sq = self.max_distance * self.max_distance
+        # Greedy matching by minimum distance
+        rows = dist_sq.min(axis=1).argsort()
+        cols = dist_sq.argmin(axis=1)[rows]
 
-            # Find minimum distance matches
-            rows = D.min(axis=1).argsort()
-            cols = D.argmin(axis=1)[rows]
+        used_rows, used_cols = set(), set()
 
-            used_rows = set()
-            used_cols = set()
+        for row, col in zip(rows, cols):
+            if row in used_rows or col in used_cols:
+                continue
+            if dist_sq[row, col] > max_dist_sq:
+                continue
 
-            for row, col in zip(rows, cols):
-                if row in used_rows or col in used_cols:
-                    continue
+            oid = object_ids[row]
+            det = detections[col]
+            self._update_object(oid, det, now)
 
-                if D[row, col] > max_dist_sq:
-                    continue
+            used_rows.add(row)
+            used_cols.add(col)
 
-                object_id = object_ids[row]
-                detection = detections[col]
+        # Mark unmatched objects as disappeared
+        for row in set(range(len(object_ids))) - used_rows:
+            oid = object_ids[row]
+            self._disappeared[oid] += 1
+            self._objects[oid].frames_missing += 1
+            if self._disappeared[oid] > self.max_disappeared:
+                self._deregister(oid)
 
-                # Update object with new detection
-                old_obj = self._objects[object_id]
-                old_center = old_obj.center
-                new_center = detection.center
-
-                # Calculate velocity with exponential smoothing for stability
-                dt = current_time - old_obj.last_update
-                # Clamp dt to avoid velocity spikes from very small intervals
-                if MIN_VELOCITY_DT < dt < MAX_VELOCITY_DT:
-                    raw_vx = (new_center[0] - old_center[0]) / dt
-                    raw_vy = (new_center[1] - old_center[1]) / dt
-                    # Smooth velocity for stability
-                    alpha = VELOCITY_SMOOTHING_ALPHA
-                    old_vx, old_vy = old_obj.velocity
-                    vx = alpha * raw_vx + (1 - alpha) * old_vx
-                    vy = alpha * raw_vy + (1 - alpha) * old_vy
-                else:
-                    vx, vy = old_obj.velocity  # Keep previous velocity
-
-                self._objects[object_id] = TrackedObject(
-                    object_id=object_id,
-                    class_name=detection.class_name,
-                    center=new_center,
-                    bbox=detection.bbox,
-                    confidence=detection.confidence,
-                    frames_visible=old_obj.frames_visible + 1,
-                    frames_missing=0,
-                    velocity=(vx, vy),
-                    last_update=current_time,
-                )
-                self._disappeared[object_id] = 0
-
-                used_rows.add(row)
-                used_cols.add(col)
-
-            # Handle unmatched existing objects
-            unused_rows = set(range(len(object_ids))) - used_rows
-            for row in unused_rows:
-                object_id = object_ids[row]
-                self._disappeared[object_id] += 1
-                self._objects[object_id].frames_missing += 1
-
-                if self._disappeared[object_id] > self.max_disappeared:
-                    self._deregister(object_id)
-
-            # Register new unmatched detections
-            unused_cols = set(range(len(detections))) - used_cols
-            for col in unused_cols:
-                self._register(detections[col], current_time)
+        # Register unmatched detections
+        for col in set(range(len(detections))) - used_cols:
+            self._register(detections[col], now)
 
         return self.objects
 
-    def _register(self, detection: Detection, timestamp: float) -> int:
-        """Register a new object."""
-        object_id = self._next_object_id
-        self._objects[object_id] = TrackedObject(
-            object_id=object_id,
-            class_name=detection.class_name,
-            center=detection.center,
-            bbox=detection.bbox,
-            confidence=detection.confidence,
-            frames_visible=1,
-            frames_missing=0,
+    def _register(self, det: Detection, timestamp: float) -> int:
+        """Register new object."""
+        oid = self._next_id
+        self._objects[oid] = TrackedObject(
+            object_id=oid,
+            class_name=det.class_name,
+            center=det.center,
+            bbox=det.bbox,
+            confidence=det.confidence,
             velocity=(0.0, 0.0),
             last_update=timestamp,
         )
-        self._disappeared[object_id] = 0
-        self._next_object_id += 1
-        return object_id
+        self._disappeared[oid] = 0
+        self._next_id += 1
+        return oid
 
-    def _deregister(self, object_id: int) -> None:
-        """Deregister an object."""
-        del self._objects[object_id]
-        del self._disappeared[object_id]
+    def _update_object(self, oid: int, det: Detection, timestamp: float) -> None:
+        """Update existing object with new detection."""
+        old = self._objects[oid]
+        dt = timestamp - old.last_update
+
+        # Calculate smoothed velocity
+        if MIN_VELOCITY_DT < dt < MAX_VELOCITY_DT:
+            raw_vx = (det.center[0] - old.center[0]) / dt
+            raw_vy = (det.center[1] - old.center[1]) / dt
+            vx = VELOCITY_SMOOTHING * raw_vx + (1 - VELOCITY_SMOOTHING) * old.velocity[0]
+            vy = VELOCITY_SMOOTHING * raw_vy + (1 - VELOCITY_SMOOTHING) * old.velocity[1]
+        else:
+            vx, vy = old.velocity
+
+        self._objects[oid] = TrackedObject(
+            object_id=oid,
+            class_name=det.class_name,
+            center=det.center,
+            bbox=det.bbox,
+            confidence=det.confidence,
+            frames_visible=old.frames_visible + 1,
+            frames_missing=0,
+            velocity=(vx, vy),
+            last_update=timestamp,
+        )
+        self._disappeared[oid] = 0
+
+    def _deregister(self, oid: int) -> None:
+        """Remove object from tracking."""
+        del self._objects[oid]
+        del self._disappeared[oid]
 
     def reset(self) -> None:
         """Reset tracker state."""
         self._objects.clear()
         self._disappeared.clear()
-        self._next_object_id = 0
+        self._next_id = 0
 
 
 # =============================================================================
@@ -247,119 +249,94 @@ class CentroidTracker:
 # =============================================================================
 
 class KalmanFilter:
-    """Kalman filter for bounding box tracking."""
+    """Kalman filter for bounding box tracking (constant velocity model)."""
 
     def __init__(self):
-        # State transition matrix (constant velocity model)
+        # State: [cx, cy, aspect_ratio, height, vx, vy, va, vh]
         self._motion_mat = np.eye(8, dtype=np.float32)
         for i in range(4):
             self._motion_mat[i, i + 4] = 1.0
 
-        # Measurement matrix
         self._update_mat = np.eye(4, 8, dtype=np.float32)
-
-        # Process noise (tuned for typical video tracking)
-        self._std_weight_position = 1.0 / 20
-        self._std_weight_velocity = 1.0 / 160
+        self._std_weight_pos = 1.0 / 20
+        self._std_weight_vel = 1.0 / 160
 
     def initiate(self, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Initialize track from first detection.
-
-        Args:
-            measurement: [cx, cy, aspect_ratio, height]
-
-        Returns:
-            (mean, covariance) tuple
-        """
-        mean_pos = measurement
-        mean_vel = np.zeros(4, dtype=np.float32)
-        mean = np.concatenate([mean_pos, mean_vel])
-
-        # Initial covariance
+        """Initialize track from measurement [cx, cy, aspect_ratio, height]."""
+        mean = np.concatenate([measurement, np.zeros(4, dtype=np.float32)])
         std = [
-            2 * self._std_weight_position * measurement[3],
-            2 * self._std_weight_position * measurement[3],
+            2 * self._std_weight_pos * measurement[3],
+            2 * self._std_weight_pos * measurement[3],
             1e-2,
-            2 * self._std_weight_position * measurement[3],
-            10 * self._std_weight_velocity * measurement[3],
-            10 * self._std_weight_velocity * measurement[3],
+            2 * self._std_weight_pos * measurement[3],
+            10 * self._std_weight_vel * measurement[3],
+            10 * self._std_weight_vel * measurement[3],
             1e-5,
-            10 * self._std_weight_velocity * measurement[3],
+            10 * self._std_weight_vel * measurement[3],
         ]
         covariance = np.diag(np.square(std).astype(np.float32))
-
         return mean, covariance
 
-    def predict(self, mean: np.ndarray, covariance: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def predict(self, mean: np.ndarray, cov: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Predict next state."""
         std = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
+            self._std_weight_pos * mean[3],
+            self._std_weight_pos * mean[3],
             1e-2,
-            self._std_weight_position * mean[3],
-            self._std_weight_velocity * mean[3],
-            self._std_weight_velocity * mean[3],
+            self._std_weight_pos * mean[3],
+            self._std_weight_vel * mean[3],
+            self._std_weight_vel * mean[3],
             1e-5,
-            self._std_weight_velocity * mean[3],
+            self._std_weight_vel * mean[3],
         ]
         motion_cov = np.diag(np.square(std).astype(np.float32))
-
         mean = self._motion_mat @ mean
-        covariance = self._motion_mat @ covariance @ self._motion_mat.T + motion_cov
+        cov = self._motion_mat @ cov @ self._motion_mat.T + motion_cov
+        return mean, cov
 
-        return mean, covariance
-
-    def update(
-        self, mean: np.ndarray, covariance: np.ndarray, measurement: np.ndarray
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Update state with new measurement."""
+    def update(self, mean: np.ndarray, cov: np.ndarray,
+               measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Update state with measurement."""
         std = [
-            self._std_weight_position * mean[3],
-            self._std_weight_position * mean[3],
+            self._std_weight_pos * mean[3],
+            self._std_weight_pos * mean[3],
             1e-1,
-            self._std_weight_position * mean[3],
+            self._std_weight_pos * mean[3],
         ]
         innovation_cov = np.diag(np.square(std).astype(np.float32))
 
-        # Project state to measurement space
-        projected_mean = self._update_mat @ mean
-        projected_cov = self._update_mat @ covariance @ self._update_mat.T + innovation_cov
+        proj_mean = self._update_mat @ mean
+        proj_cov = self._update_mat @ cov @ self._update_mat.T + innovation_cov
 
-        # Kalman gain
-        chol = np.linalg.cholesky(projected_cov)
+        chol = np.linalg.cholesky(proj_cov)
         kalman_gain = np.linalg.solve(
-            chol.T, np.linalg.solve(chol, (covariance @ self._update_mat.T).T)
+            chol.T, np.linalg.solve(chol, (cov @ self._update_mat.T).T)
         ).T
 
-        # Update
-        innovation = measurement - projected_mean
+        innovation = measurement - proj_mean
         new_mean = mean + kalman_gain @ innovation
-        new_covariance = covariance - kalman_gain @ projected_cov @ kalman_gain.T
-
-        return new_mean, new_covariance
+        new_cov = cov - kalman_gain @ proj_cov @ kalman_gain.T
+        return new_mean, new_cov
 
 
 class STrack:
-    """Single object track for ByteTrack."""
+    """Single track for ByteTrack."""
 
     _count = 0
     shared_kalman = KalmanFilter()
 
     def __init__(self, detection: Detection):
-        self.track_id = 0  # Assigned when activated
+        self.track_id = 0
         self.is_activated = False
-        self.state = "new"  # new, tracked, lost, removed
+        self.state = "new"
 
-        # Detection info
         self.class_name = detection.class_name
         self.score = detection.confidence
-        self.bbox = detection.bbox  # x1, y1, x2, y2
+        self.bbox = detection.bbox
 
-        # Kalman state
         self.mean: Optional[np.ndarray] = None
         self.covariance: Optional[np.ndarray] = None
 
-        # Frame counters
         self.frame_id = 0
         self.start_frame = 0
         self.tracklet_len = 0
@@ -374,23 +351,21 @@ class STrack:
         STrack._count = 0
 
     def activate(self, frame_id: int) -> None:
-        """Activate a new track."""
+        """Activate new track."""
         self.track_id = STrack.next_id()
         self.is_activated = True
         self.state = "tracked"
         self.frame_id = frame_id
         self.start_frame = frame_id
-        self.tracklet_len = 0
 
-        # Initialize Kalman filter
         measurement = self._bbox_to_xyah(self.bbox)
         self.mean, self.covariance = self.shared_kalman.initiate(measurement)
 
-    def re_activate(self, detection: Detection, frame_id: int, new_id: bool = False) -> None:
-        """Re-activate a lost track."""
-        self.bbox = detection.bbox
-        self.score = detection.confidence
-        self.class_name = detection.class_name
+    def re_activate(self, det: Detection, frame_id: int, new_id: bool = False) -> None:
+        """Re-activate lost track."""
+        self.bbox = det.bbox
+        self.score = det.confidence
+        self.class_name = det.class_name
         self.state = "tracked"
         self.is_activated = True
         self.frame_id = frame_id
@@ -400,20 +375,21 @@ class STrack:
         self.mean, self.covariance = self.shared_kalman.update(
             self.mean, self.covariance, measurement
         )
-
         if new_id:
             self.track_id = STrack.next_id()
 
     def predict(self) -> None:
-        """Predict next state using Kalman filter."""
-        if self.mean is not None and self.covariance is not None:
-            self.mean, self.covariance = self.shared_kalman.predict(self.mean, self.covariance)
+        """Predict next state."""
+        if self.mean is not None:
+            self.mean, self.covariance = self.shared_kalman.predict(
+                self.mean, self.covariance
+            )
 
-    def update(self, detection: Detection, frame_id: int) -> None:
-        """Update track with matched detection."""
-        self.bbox = detection.bbox
-        self.score = detection.confidence
-        self.class_name = detection.class_name
+    def update(self, det: Detection, frame_id: int) -> None:
+        """Update with matched detection."""
+        self.bbox = det.bbox
+        self.score = det.confidence
+        self.class_name = det.class_name
         self.state = "tracked"
         self.is_activated = True
         self.frame_id = frame_id
@@ -425,325 +401,254 @@ class STrack:
         )
 
     def mark_lost(self) -> None:
-        """Mark track as lost."""
         self.state = "lost"
 
     def mark_removed(self) -> None:
-        """Mark track as removed."""
         self.state = "removed"
 
     @property
     def center(self) -> Tuple[int, int]:
-        """Get bounding box center."""
         x1, y1, x2, y2 = self.bbox
         return ((x1 + x2) // 2, (y1 + y2) // 2)
 
     @property
     def predicted_bbox(self) -> Tuple[int, int, int, int]:
-        """Get predicted bounding box from Kalman state."""
         if self.mean is None:
             return self.bbox
         return self._xyah_to_bbox(self.mean[:4])
 
     def _bbox_to_xyah(self, bbox: Tuple[int, int, int, int]) -> np.ndarray:
-        """Convert bbox (x1,y1,x2,y2) to (cx, cy, aspect_ratio, height)."""
+        """Convert bbox to [cx, cy, aspect_ratio, height]."""
         x1, y1, x2, y2 = bbox
-        w = x2 - x1
-        h = max(1, y2 - y1)
-        cx = x1 + w / 2
-        cy = y1 + h / 2
-        return np.array([cx, cy, w / h, h], dtype=np.float32)
+        w, h = x2 - x1, max(1, y2 - y1)
+        return np.array([x1 + w / 2, y1 + h / 2, w / h, h], dtype=np.float32)
 
     def _xyah_to_bbox(self, xyah: np.ndarray) -> Tuple[int, int, int, int]:
-        """Convert (cx, cy, aspect_ratio, height) to bbox (x1,y1,x2,y2)."""
+        """Convert [cx, cy, aspect_ratio, height] to bbox."""
         cx, cy, a, h = xyah
         w = a * h
-        x1 = int(cx - w / 2)
-        y1 = int(cy - h / 2)
-        x2 = int(cx + w / 2)
-        y2 = int(cy + h / 2)
-        return (x1, y1, x2, y2)
+        return (int(cx - w / 2), int(cy - h / 2), int(cx + w / 2), int(cy + h / 2))
 
 
 class ByteTracker:
-    """ByteTrack multi-object tracker with Kalman filtering."""
+    """
+    ByteTrack multi-object tracker.
 
-    def __init__(
-        self,
-        max_disappeared: int = 30,
-        max_distance: int = 100,
-        high_thresh: float = 0.5,
-        low_thresh: float = 0.1,
-        match_thresh: float = 0.8,
-    ):
+    Uses Kalman filter for motion prediction and IoU for association.
+    Handles low-confidence detections in second association pass.
+    """
+
+    def __init__(self, max_disappeared: int = 30, max_distance: int = 100,
+                 high_thresh: float = 0.5, low_thresh: float = 0.1,
+                 match_thresh: float = 0.8):
         self.max_disappeared = max_disappeared
         self.max_distance = max_distance
         self.high_thresh = high_thresh
         self.low_thresh = low_thresh
         self.match_thresh = match_thresh
 
-        self._tracked_stracks: List[STrack] = []
-        self._lost_stracks: List[STrack] = []
-        self._removed_stracks: List[STrack] = []
+        self._tracked: List[STrack] = []
+        self._lost: List[STrack] = []
         self._frame_id = 0
 
     @property
     def objects(self) -> Dict[int, TrackedObject]:
-        """Get all tracked objects including recently lost ones.
-
-        Returns both actively tracked and recently lost objects.
-        Lost objects use Kalman-predicted positions to maintain visual continuity.
-        """
+        """Get all tracked objects including recently lost."""
         result = {}
-        current_time = time.time()
+        now = time.time()
 
-        # Add actively tracked objects
-        for track in self._tracked_stracks:
+        for track in self._tracked:
             if track.is_activated:
-                result[track.track_id] = TrackedObject(
-                    object_id=track.track_id,
-                    class_name=track.class_name,
-                    center=track.center,
-                    bbox=track.bbox,
-                    confidence=track.score,
-                    frames_visible=track.tracklet_len,
-                    frames_missing=0,
-                    velocity=self._estimate_velocity(track),
-                    last_update=current_time,
-                )
+                result[track.track_id] = self._track_to_object(track, 0, now)
 
-        # Add recently lost objects with predicted positions (prevents flickering)
-        for track in self._lost_stracks:
+        for track in self._lost:
             if track.track_id not in result:
                 frames_lost = self._frame_id - track.frame_id
-                # Use predicted bbox from Kalman filter for smoother tracking
-                predicted_bbox = track.predicted_bbox
-                cx = (predicted_bbox[0] + predicted_bbox[2]) // 2
-                cy = (predicted_bbox[1] + predicted_bbox[3]) // 2
-                result[track.track_id] = TrackedObject(
-                    object_id=track.track_id,
-                    class_name=track.class_name,
-                    center=(cx, cy),
-                    bbox=predicted_bbox,
-                    confidence=track.score * 0.8,  # Reduce confidence for lost tracks
-                    frames_visible=track.tracklet_len,
-                    frames_missing=frames_lost,
-                    velocity=self._estimate_velocity(track),
-                    last_update=current_time,
-                )
+                result[track.track_id] = self._track_to_object(track, frames_lost, now)
 
         return result
 
-    def _estimate_velocity(self, track: STrack) -> Tuple[float, float]:
-        """Estimate velocity from Kalman state."""
+    def _track_to_object(self, track: STrack, frames_missing: int,
+                         timestamp: float) -> TrackedObject:
+        """Convert STrack to TrackedObject."""
+        bbox = track.predicted_bbox if frames_missing > 0 else track.bbox
+        cx, cy = (bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2
+
+        # Extract velocity from Kalman state
+        vx, vy = 0.0, 0.0
         if track.mean is not None and len(track.mean) >= 6:
-            # vx, vy are in state indices 4, 5
-            return (float(track.mean[4]), float(track.mean[5]))
-        return (0.0, 0.0)
+            vx, vy = float(track.mean[4]), float(track.mean[5])
+
+        return TrackedObject(
+            object_id=track.track_id,
+            class_name=track.class_name,
+            center=(cx, cy),
+            bbox=bbox,
+            confidence=track.score * (0.8 if frames_missing > 0 else 1.0),
+            frames_visible=track.tracklet_len,
+            frames_missing=frames_missing,
+            velocity=(vx, vy),
+            last_update=timestamp,
+        )
 
     def update(self, detections: List[Detection]) -> Dict[int, TrackedObject]:
         """Update tracker with new detections."""
         self._frame_id += 1
 
-        # Predict all tracked stracks
-        for track in self._tracked_stracks:
-            track.predict()
-        for track in self._lost_stracks:
-            track.predict()
+        # Predict all tracks
+        for t in self._tracked + self._lost:
+            t.predict()
 
         # Split detections by confidence
-        high_dets = []
-        low_dets = []
-        high_stracks = []
-        low_stracks = []
+        high_dets, low_dets = [], []
+        high_tracks, low_tracks = [], []
         for d in detections:
-            conf = d.confidence
-            if conf >= self.high_thresh:
+            if d.confidence >= self.high_thresh:
                 high_dets.append(d)
-                high_stracks.append(STrack(d))
-            elif conf >= self.low_thresh:
+                high_tracks.append(STrack(d))
+            elif d.confidence >= self.low_thresh:
                 low_dets.append(d)
-                low_stracks.append(STrack(d))
+                low_tracks.append(STrack(d))
 
-        # Partition tracked stracks in single pass (avoids 2 list comprehensions)
-        unconfirmed = []
-        tracked = []
-        for t in self._tracked_stracks:
-            if t.is_activated:
-                tracked.append(t)
-            else:
-                unconfirmed.append(t)
+        # Separate confirmed and unconfirmed tracks
+        confirmed = [t for t in self._tracked if t.is_activated]
+        unconfirmed = [t for t in self._tracked if not t.is_activated]
 
-        # Combine tracked and lost for matching
-        strack_pool = tracked + self._lost_stracks
+        # First association: high-conf detections with tracked + lost
+        pool = confirmed + self._lost
+        matched, unmatched_t, unmatched_d = self._associate(pool, high_tracks)
 
-        # Match high confidence detections
-        matched, unmatched_tracks, unmatched_dets = self._associate(
-            strack_pool, high_stracks, self.match_thresh
-        )
-
-        # Update matched tracks
-        for track_idx, det_idx in matched:
-            track = strack_pool[track_idx]
-            det = high_dets[det_idx]
+        for ti, di in matched:
+            track = pool[ti]
+            det = high_dets[di]
             if track.state == "tracked":
-                track.update(Detection(
-                    class_id=0, class_name=det.class_name, confidence=det.confidence,
-                    bbox=det.bbox, center=det.center
-                ), self._frame_id)
+                track.update(det, self._frame_id)
             else:
-                track.re_activate(Detection(
-                    class_id=0, class_name=det.class_name, confidence=det.confidence,
-                    bbox=det.bbox, center=det.center
-                ), self._frame_id)
+                track.re_activate(det, self._frame_id)
 
-        # --- Second association: low confidence with remaining tracked ---
-        remaining_tracks = [strack_pool[i] for i in unmatched_tracks if strack_pool[i].state == "tracked"]
-        matched2, unmatched_tracks2, _ = self._associate(
-            remaining_tracks, low_stracks, 0.5  # Lower threshold for low-conf
-        )
+        # Second association: low-conf with remaining tracked
+        remaining = [pool[i] for i in unmatched_t if pool[i].state == "tracked"]
+        matched2, unmatched_t2, _ = self._associate(remaining, low_tracks, thresh=0.5)
 
-        for track_idx, det_idx in matched2:
-            track = remaining_tracks[track_idx]
-            det = low_dets[det_idx]
-            track.update(Detection(
-                class_id=0, class_name=det.class_name, confidence=det.confidence,
-                bbox=det.bbox, center=det.center
-            ), self._frame_id)
+        for ti, di in matched2:
+            remaining[ti].update(low_dets[di], self._frame_id)
 
         # Mark unmatched tracks as lost
-        # Build set of matched track indices from second association for O(1) lookup
-        matched2_track_indices = {track_idx for track_idx, _ in matched2}
-        for idx in unmatched_tracks:
-            track = strack_pool[idx]
+        matched2_set = {ti for ti, _ in matched2}
+        for i in unmatched_t:
+            track = pool[i]
             if track.state == "tracked":
-                # Check if this track is in remaining_tracks and was matched in second pass
-                track_in_remaining = track in remaining_tracks
-                if not track_in_remaining:
-                    track.mark_lost()
-                else:
-                    remaining_idx = remaining_tracks.index(track)
-                    if remaining_idx not in matched2_track_indices:
+                if track in remaining:
+                    ri = remaining.index(track)
+                    if ri not in matched2_set:
                         track.mark_lost()
+                else:
+                    track.mark_lost()
 
-        # Handle unconfirmed tracks
-        # Build list of unmatched high-conf STracks for association with unconfirmed
-        unmatched_high_stracks = [high_stracks[i] for i in unmatched_dets]
-        matched_unconf, unmatched_unconf, unmatched_from_high = self._associate(
-            unconfirmed, unmatched_high_stracks, 0.7
-        )
-        for track_idx, det_idx in matched_unconf:
-            # det_idx is index into unmatched_high_stracks
-            original_det_idx = unmatched_dets[det_idx]
-            unconfirmed[track_idx].update(
-                high_dets[original_det_idx], self._frame_id
-            )
-        for idx in unmatched_unconf:
-            unconfirmed[idx].mark_removed()
+        # Match unconfirmed with remaining high-conf detections
+        unmatched_high = [high_tracks[i] for i in unmatched_d]
+        matched3, unmatched_uc, unmatched_uh = self._associate(unconfirmed, unmatched_high, thresh=0.7)
 
-        # Initialize new tracks from unmatched high-confidence detections
-        for idx in unmatched_from_high:
-            # idx is index into unmatched_high_stracks, map back to original
-            original_det_idx = unmatched_dets[idx]
-            if original_det_idx < len(high_dets) and high_dets[original_det_idx].confidence >= self.high_thresh:
-                # Use the STrack from unmatched_high_stracks (same as high_stracks[original_det_idx])
-                new_track = unmatched_high_stracks[idx]
+        for ti, di in matched3:
+            unconfirmed[ti].update(high_dets[unmatched_d[di]], self._frame_id)
+        for i in unmatched_uc:
+            unconfirmed[i].mark_removed()
+
+        # Initialize new tracks from unmatched high-conf
+        for i in unmatched_uh:
+            det_idx = unmatched_d[i]
+            if high_dets[det_idx].confidence >= self.high_thresh:
+                new_track = unmatched_high[i]
                 new_track.activate(self._frame_id)
-                self._tracked_stracks.append(new_track)
+                self._tracked.append(new_track)
 
         # Update track lists
-        self._tracked_stracks = [t for t in self._tracked_stracks if t.state == "tracked"]
+        self._tracked = [t for t in self._tracked if t.state == "tracked"]
 
-        # Move lost tracks
-        for track in strack_pool:
-            if track.state == "lost" and track not in self._lost_stracks:
-                self._lost_stracks.append(track)
+        for t in pool:
+            if t.state == "lost" and t not in self._lost:
+                self._lost.append(t)
 
-        # Remove tracks lost for too long
-        self._lost_stracks = [
-            t for t in self._lost_stracks
+        self._lost = [
+            t for t in self._lost
             if self._frame_id - t.frame_id <= self.max_disappeared and t.state != "removed"
         ]
 
         return self.objects
 
-    def _associate(
-        self,
-        tracks: List[STrack],
-        detections: List[STrack],
-        thresh: float,
-    ) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
+    def _associate(self, tracks: List[STrack], detections: List[STrack],
+                   thresh: float = None) -> Tuple[List[Tuple[int, int]], List[int], List[int]]:
         """Associate tracks with detections using IoU."""
-        if len(tracks) == 0 or len(detections) == 0:
+        thresh = thresh or self.match_thresh
+
+        if not tracks or not detections:
             return [], list(range(len(tracks))), list(range(len(detections)))
 
-        # Compute IoU distance matrix
-        cost_matrix = np.zeros((len(tracks), len(detections)), dtype=np.float32)
-        for i, track in enumerate(tracks):
-            for j, det in enumerate(detections):
-                iou = self._compute_iou(track.predicted_bbox, det.bbox)
-                cost_matrix[i, j] = 1.0 - iou
+        # Compute IoU cost matrix
+        cost = np.zeros((len(tracks), len(detections)), dtype=np.float32)
+        for i, t in enumerate(tracks):
+            for j, d in enumerate(detections):
+                cost[i, j] = 1.0 - self._iou(t.predicted_bbox, d.bbox)
 
-        # Simple greedy matching (could use Hungarian algorithm for optimality)
+        # Greedy matching
         matched = []
-        unmatched_tracks = set(range(len(tracks)))
-        unmatched_dets = set(range(len(detections)))
+        unmatched_t = set(range(len(tracks)))
+        unmatched_d = set(range(len(detections)))
 
-        # Sort by cost and greedily assign
-        indices = np.unravel_index(np.argsort(cost_matrix, axis=None), cost_matrix.shape)
+        indices = np.unravel_index(np.argsort(cost, axis=None), cost.shape)
         for i, j in zip(indices[0], indices[1]):
-            if i in unmatched_tracks and j in unmatched_dets:
-                if cost_matrix[i, j] <= thresh:
-                    matched.append((i, j))
-                    unmatched_tracks.discard(i)
-                    unmatched_dets.discard(j)
+            if i in unmatched_t and j in unmatched_d and cost[i, j] <= thresh:
+                matched.append((i, j))
+                unmatched_t.discard(i)
+                unmatched_d.discard(j)
 
-        return matched, list(unmatched_tracks), list(unmatched_dets)
+        return matched, list(unmatched_t), list(unmatched_d)
 
-    def _compute_iou(
-        self,
-        bbox1: Tuple[int, int, int, int],
-        bbox2: Tuple[int, int, int, int],
-    ) -> float:
-        """Compute Intersection over Union."""
-        x1 = max(bbox1[0], bbox2[0])
-        y1 = max(bbox1[1], bbox2[1])
-        x2 = min(bbox1[2], bbox2[2])
-        y2 = min(bbox1[3], bbox2[3])
+    def _iou(self, box1: Tuple, box2: Tuple) -> float:
+        """Compute IoU between two bboxes."""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
 
         inter = max(0, x2 - x1) * max(0, y2 - y1)
-        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
-        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
         union = area1 + area2 - inter
 
-        if union <= 0:
-            return 0.0
-        return inter / union
+        return inter / union if union > 0 else 0.0
 
     def reset(self) -> None:
         """Reset tracker state."""
-        self._tracked_stracks.clear()
-        self._lost_stracks.clear()
-        self._removed_stracks.clear()
+        self._tracked.clear()
+        self._lost.clear()
         self._frame_id = 0
         STrack.reset_id()
 
 
+# =============================================================================
+# Target Tracker (High-Level Interface)
+# =============================================================================
+
 class TargetTracker:
-    """High-level target tracker with lock-on capability."""
+    """
+    High-level tracker with lock-on capability.
+
+    Wraps either CentroidTracker or ByteTracker and adds:
+    - Automatic target selection and lock-on
+    - Target re-identification after loss
+    - State machine for tracking workflow
+    """
 
     def __init__(self, config: TrackerConfig, frame_size: Tuple[int, int]):
         self.config = config
-        # Validate frame size to prevent division by zero
         self.frame_width = max(1, frame_size[0])
         self.frame_height = max(1, frame_size[1])
         self.frame_center = (self.frame_width // 2, self.frame_height // 2)
 
-        # Initialize tracker based on algorithm selection
-        algorithm = config.algorithm.lower()
-
-        if algorithm == "bytetrack":
-            logger.info("Using ByteTrack algorithm (Kalman + IoU matching)")
+        # Initialize underlying tracker
+        if config.algorithm.lower() == "bytetrack":
+            logger.info("Using ByteTrack algorithm")
             self._tracker = ByteTracker(
                 max_disappeared=config.max_disappeared,
                 max_distance=config.max_distance,
@@ -752,7 +657,7 @@ class TargetTracker:
                 match_thresh=config.match_thresh,
             )
         else:
-            logger.info("Using Centroid tracker algorithm")
+            logger.info("Using Centroid tracker")
             self._tracker = CentroidTracker(
                 max_disappeared=config.max_disappeared,
                 max_distance=config.max_distance,
@@ -760,110 +665,64 @@ class TargetTracker:
 
         # Lock-on state
         self._state = TrackingState.SEARCHING
-        self._locked_target_id: Optional[int] = None
-        self._lock_candidate_id: Optional[int] = None
+        self._locked_id: Optional[int] = None
+        self._candidate_id: Optional[int] = None
         self._lock_frames = 0
         self._lost_frames = 0
 
-        # Target re-identification state
-        self._last_locked_class: Optional[str] = None
-        self._last_locked_position: Optional[Tuple[int, int]] = None
-        self._last_locked_bbox_size: Optional[Tuple[int, int]] = None
-        self._last_locked_velocity: Tuple[float, float] = (0.0, 0.0)
-        self._reacquire_radius = config.max_distance * REACQUIRE_RADIUS_MULTIPLIER
-
-        # Target selection callback
-        self._target_selector = self._default_target_selector
+        # Re-identification state
+        self._last_class: Optional[str] = None
+        self._last_position: Optional[Tuple[int, int]] = None
+        self._last_size: Optional[Tuple[int, int]] = None
+        self._last_velocity: Tuple[float, float] = (0.0, 0.0)
+        self._reacquire_radius = config.max_distance * REACQUIRE_RADIUS_MULT
 
     @property
     def state(self) -> TrackingState:
-        """Current tracking state."""
         return self._state
 
     @property
     def locked_target(self) -> Optional[TrackedObject]:
-        """Get locked target if any."""
-        if self._locked_target_id is not None:
-            objects = self._tracker.objects
-            return objects.get(self._locked_target_id)
+        if self._locked_id is not None:
+            return self._tracker.objects.get(self._locked_id)
         return None
 
     @property
     def all_targets(self) -> Dict[int, TrackedObject]:
-        """Get all tracked objects."""
         return self._tracker.objects
 
-    def update(
-        self,
-        detections: List[Detection],
-        frame: Optional[np.ndarray] = None,
-    ) -> Optional[TrackedObject]:
-        """
-        Update tracker with new detections.
-
-        Args:
-            detections: List of detections from detector
-            frame: Unused, kept for API compatibility
-
-        Returns:
-            Locked target if tracking, None otherwise
-        """
-        # Update object tracker
+    def update(self, detections: List[Detection],
+               frame: Optional[np.ndarray] = None) -> Optional[TrackedObject]:
+        """Update tracker with new detections."""
         objects = self._tracker.update(detections)
 
         # State machine
         if self._state == TrackingState.SEARCHING:
             self._handle_searching(objects)
-
         elif self._state == TrackingState.ACQUIRING:
             self._handle_acquiring(objects)
-
         elif self._state == TrackingState.LOCKED:
             self._handle_locked(objects)
-
         elif self._state == TrackingState.LOST:
             self._handle_lost(objects)
 
         return self.locked_target
 
     def lock_target(self, target_id: int) -> bool:
-        """
-        Manually lock onto a specific target.
-
-        Args:
-            target_id: Object ID to lock onto
-
-        Returns:
-            True if lock successful
-        """
+        """Manually lock onto a target."""
         if target_id in self._tracker.objects:
-            self._locked_target_id = target_id
+            self._locked_id = target_id
             self._state = TrackingState.LOCKED
             self._lost_frames = 0
             self._save_target_info(self._tracker.objects[target_id])
-            logger.info(f"Manual lock on target {target_id}")
+            logger.info(f"Locked target {target_id}")
             return True
         return False
 
-    def lock_on_bbox(
-        self,
-        bbox: Tuple[int, int, int, int],
-        frame: Optional[np.ndarray] = None,
-        class_name: str = "target",
-    ) -> bool:
-        """
-        Initialize tracking on a specific bounding box.
-
-        Args:
-            bbox: Target bounding box (x1, y1, x2, y2)
-            frame: Unused, kept for API compatibility
-            class_name: Class name for the target
-
-        Returns:
-            True if lock successful
-        """
-        # Create a detection and update the tracker
-        from .detector import Detection
+    def lock_on_bbox(self, bbox: Tuple[int, int, int, int],
+                     frame: Optional[np.ndarray] = None,
+                     class_name: str = "target") -> bool:
+        """Initialize tracking on a bounding box."""
         det = Detection(
             class_id=0,
             class_name=class_name,
@@ -873,228 +732,182 @@ class TargetTracker:
         )
         objects = self._tracker.update([det])
         if objects:
-            target_id = list(objects.keys())[0]
-            return self.lock_target(target_id)
-
+            return self.lock_target(list(objects.keys())[0])
         return False
-
-    def _save_target_info(self, target: TrackedObject) -> None:
-        """Save target info for re-identification."""
-        self._last_locked_class = target.class_name
-        self._last_locked_position = target.center
-        bbox = target.bbox
-        self._last_locked_bbox_size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
-        self._last_locked_velocity = target.velocity
 
     def unlock(self) -> None:
         """Release lock and return to searching."""
-        self._locked_target_id = None
-        self._lock_candidate_id = None
+        self._locked_id = None
+        self._candidate_id = None
         self._lock_frames = 0
         self._lost_frames = 0
         self._state = TrackingState.SEARCHING
-        logger.info("Target unlocked, returning to search mode")
+        logger.info("Target unlocked")
 
     def get_tracking_error(self) -> Optional[Tuple[float, float]]:
-        """
-        Get normalized tracking error for PID controller.
-
-        Returns:
-            (x_error, y_error) normalized to [-1, 1] where:
-            - Negative X = target is left of center
-            - Positive X = target is right of center
-            - Negative Y = target is above center
-            - Positive Y = target is below center
-            Returns None if no locked target.
-        """
+        """Get normalized tracking error [-1, 1] for PID controller."""
         target = self.locked_target
         if target is None:
             return None
 
-        # Calculate error from center
         error_x = (target.center[0] - self.frame_center[0]) / (self.frame_width / 2)
         error_y = (target.center[1] - self.frame_center[1]) / (self.frame_height / 2)
 
-        # Clamp to [-1, 1]
-        error_x = max(-1.0, min(1.0, error_x))
-        error_y = max(-1.0, min(1.0, error_y))
-
-        return (error_x, error_y)
+        return (
+            max(-1.0, min(1.0, error_x)),
+            max(-1.0, min(1.0, error_y)),
+        )
 
     def reset(self) -> None:
-        """Reset tracker to initial state."""
+        """Reset to initial state."""
         self._tracker.reset()
         self.unlock()
 
+    def _save_target_info(self, target: TrackedObject) -> None:
+        """Save target info for re-identification."""
+        self._last_class = target.class_name
+        self._last_position = target.center
+        self._last_size = (target.bbox[2] - target.bbox[0], target.bbox[3] - target.bbox[1])
+        self._last_velocity = target.velocity
+
     def _handle_searching(self, objects: Dict[int, TrackedObject]) -> None:
-        """Handle SEARCHING state."""
+        """Look for a target to lock onto."""
         if not objects:
             return
 
-        # Select best target candidate
-        candidate = self._target_selector(objects)
+        candidate = self._select_best_target(objects)
         if candidate and candidate.confidence >= self.config.min_confidence:
-            self._lock_candidate_id = candidate.object_id
+            self._candidate_id = candidate.object_id
             self._lock_frames = 1
             self._state = TrackingState.ACQUIRING
-            logger.debug(f"Acquiring target {candidate.object_id}")
 
     def _handle_acquiring(self, objects: Dict[int, TrackedObject]) -> None:
-        """Handle ACQUIRING state."""
-        if self._lock_candidate_id not in objects:
-            # Lost candidate, back to searching
-            self._lock_candidate_id = None
+        """Confirm lock on candidate."""
+        if self._candidate_id not in objects:
+            self._candidate_id = None
             self._lock_frames = 0
             self._state = TrackingState.SEARCHING
             return
 
-        candidate = objects[self._lock_candidate_id]
+        candidate = objects[self._candidate_id]
         if candidate.confidence >= self.config.min_confidence:
             self._lock_frames += 1
             if self._lock_frames >= self.config.frames_to_lock:
-                # Lock confirmed
-                self._locked_target_id = self._lock_candidate_id
-                self._lock_candidate_id = None
+                self._locked_id = self._candidate_id
+                self._candidate_id = None
                 self._state = TrackingState.LOCKED
                 self._save_target_info(candidate)
-                logger.info(f"Target {self._locked_target_id} locked")
+                logger.info(f"Target {self._locked_id} locked")
         else:
-            # Confidence dropped, decay lock frames (hysteresis)
             self._lock_frames = max(0, self._lock_frames - 2)
             if self._lock_frames == 0:
-                self._lock_candidate_id = None
+                self._candidate_id = None
                 self._state = TrackingState.SEARCHING
 
     def _handle_locked(self, objects: Dict[int, TrackedObject]) -> None:
-        """Handle LOCKED state."""
-        if self._locked_target_id not in objects:
-            # Target lost
+        """Track locked target."""
+        if self._locked_id not in objects:
             self._lost_frames += 1
             if self._lost_frames >= self.config.frames_to_unlock:
                 self._state = TrackingState.LOST
-                logger.warning(f"Target {self._locked_target_id} lost, searching for reacquisition")
+                logger.warning(f"Target {self._locked_id} lost")
         else:
-            # Update saved info while locked
-            self._save_target_info(objects[self._locked_target_id])
+            self._save_target_info(objects[self._locked_id])
             self._lost_frames = 0
 
     def _handle_lost(self, objects: Dict[int, TrackedObject]) -> None:
-        """Handle LOST state - try to re-identify the target."""
-        # Check if original target ID reappeared
-        if self._locked_target_id in objects:
+        """Try to re-acquire lost target."""
+        # Check if original ID reappeared
+        if self._locked_id in objects:
             self._lost_frames = 0
             self._state = TrackingState.LOCKED
-            logger.info(f"Target {self._locked_target_id} reacquired (same ID)")
+            logger.info(f"Target {self._locked_id} reacquired")
             return
 
-        # Try to re-identify target among available objects
-        best_match = self._find_matching_target(objects)
-        if best_match is not None:
-            old_id = self._locked_target_id
-            self._locked_target_id = best_match.object_id
+        # Try to find matching target
+        match = self._find_matching_target(objects)
+        if match:
+            old_id = self._locked_id
+            self._locked_id = match.object_id
             self._lost_frames = 0
             self._state = TrackingState.LOCKED
-            self._save_target_info(best_match)
-            logger.info(f"Target reacquired: ID changed {old_id} -> {best_match.object_id}")
+            self._save_target_info(match)
+            logger.info(f"Target reacquired: {old_id} -> {match.object_id}")
             return
 
         self._lost_frames += 1
 
-        # Predict where target should be based on velocity
-        if self._last_locked_position and self._last_locked_velocity:
-            vx, vy = self._last_locked_velocity
+        # Update predicted position
+        if self._last_position and self._last_velocity:
+            vx, vy = self._last_velocity
             dt = self._lost_frames * FRAME_TIME_ESTIMATE
-            px = int(self._last_locked_position[0] + vx * dt)
-            py = int(self._last_locked_position[1] + vy * dt)
-            # Keep predicted position in frame
-            px = max(0, min(self.frame_width, px))
-            py = max(0, min(self.frame_height, py))
-            self._last_locked_position = (px, py)
+            px = int(self._last_position[0] + vx * dt)
+            py = int(self._last_position[1] + vy * dt)
+            self._last_position = (
+                max(0, min(self.frame_width, px)),
+                max(0, min(self.frame_height, py)),
+            )
 
-        # After extended loss, return to searching
-        max_lost_frames = self.config.frames_to_unlock * 3
-        if self._lost_frames > max_lost_frames:
-            logger.warning(f"Target lost for {self._lost_frames} frames, returning to search")
+        # Give up after extended loss
+        if self._lost_frames > self.config.frames_to_unlock * 3:
+            logger.warning("Target lost, returning to search")
             self.unlock()
 
     def _find_matching_target(self, objects: Dict[int, TrackedObject]) -> Optional[TrackedObject]:
-        """Find a target that matches the lost target's characteristics."""
-        if not objects or not self._last_locked_class:
+        """Find target matching lost target's characteristics."""
+        if not objects or not self._last_class:
             return None
 
-        # Pre-compute squared radius for fast comparison
-        radius_sq = self._reacquire_radius * self._reacquire_radius
-
-        best_obj = None
-        best_score = MIN_MATCH_SCORE
+        radius_sq = self._reacquire_radius ** 2
+        best_obj, best_score = None, MIN_MATCH_SCORE
 
         for obj in objects.values():
-            # Must be same class
-            if obj.class_name != self._last_locked_class:
+            if obj.class_name != self._last_class:
                 continue
 
-            # Check distance from predicted position (squared, no sqrt)
-            if self._last_locked_position:
-                dx = obj.center[0] - self._last_locked_position[0]
-                dy = obj.center[1] - self._last_locked_position[1]
+            # Distance score
+            if self._last_position:
+                dx = obj.center[0] - self._last_position[0]
+                dy = obj.center[1] - self._last_position[1]
                 dist_sq = dx * dx + dy * dy
                 if dist_sq > radius_sq:
                     continue
-                # Normalize distance score (0-1, higher is closer)
                 dist_score = 1.0 - (dist_sq / radius_sq)
             else:
                 dist_score = 1.0
 
-            # Check size similarity
+            # Size score
             size_score = 1.0
-            if self._last_locked_bbox_size:
-                obj_w = max(1, obj.bbox[2] - obj.bbox[0])
-                obj_h = max(1, obj.bbox[3] - obj.bbox[1])
-                last_w, last_h = self._last_locked_bbox_size
-                if last_w > 0 and last_h > 0:
-                    # Use min/max ratio for size similarity (safe division)
-                    w_ratio = min(obj_w, last_w) / max(obj_w, last_w)
-                    h_ratio = min(obj_h, last_h) / max(obj_h, last_h)
-                    size_score = (w_ratio + h_ratio) * 0.5
+            if self._last_size:
+                w = max(1, obj.bbox[2] - obj.bbox[0])
+                h = max(1, obj.bbox[3] - obj.bbox[1])
+                lw, lh = self._last_size
+                if lw > 0 and lh > 0:
+                    size_score = (min(w, lw) / max(w, lw) + min(h, lh) / max(h, lh)) / 2
 
-            # Score: closer is better, similar size is better, higher confidence is better
             score = dist_score * 0.4 + size_score * 0.3 + obj.confidence * 0.3
-
             if score > best_score:
                 best_score = score
                 best_obj = obj
 
         return best_obj
 
-    def _default_target_selector(
-        self, objects: Dict[int, TrackedObject]
-    ) -> Optional[TrackedObject]:
-        """
-        Default target selection: largest, highest confidence object closest to center.
-        """
+    def _select_best_target(self, objects: Dict[int, TrackedObject]) -> Optional[TrackedObject]:
+        """Select best target: largest, highest confidence, closest to center."""
         if not objects:
             return None
 
-        def score_target(obj: TrackedObject) -> float:
-            # Distance from center (normalized, lower is better)
-            # frame_width/height guaranteed >= 1 from __init__
-            dist_x = abs(obj.center[0] - self.frame_center[0]) / self.frame_width
-            dist_y = abs(obj.center[1] - self.frame_center[1]) / self.frame_height
-            center_score = 1.0 - (dist_x + dist_y) / 2
+        def score(obj: TrackedObject) -> float:
+            # Center proximity
+            dx = abs(obj.center[0] - self.frame_center[0]) / self.frame_width
+            dy = abs(obj.center[1] - self.frame_center[1]) / self.frame_height
+            center_score = 1.0 - (dx + dy) / 2
 
-            # Size score (larger is better, normalized)
-            bbox_w = max(0, obj.bbox[2] - obj.bbox[0])
-            bbox_h = max(0, obj.bbox[3] - obj.bbox[1])
-            bbox_area = bbox_w * bbox_h
-            max_area = self.frame_width * self.frame_height  # Always >= 1
-            size_score = min(1.0, bbox_area / (max_area * 0.25))
+            # Size
+            area = (obj.bbox[2] - obj.bbox[0]) * (obj.bbox[3] - obj.bbox[1])
+            max_area = self.frame_width * self.frame_height * 0.25
+            size_score = min(1.0, area / max_area)
 
-            # Combine scores
-            return (
-                obj.confidence * 0.4 +
-                center_score * 0.3 +
-                size_score * 0.3
-            )
+            return obj.confidence * 0.4 + center_score * 0.3 + size_score * 0.3
 
-        best = max(objects.values(), key=score_target)
-        return best
+        return max(objects.values(), key=score)
